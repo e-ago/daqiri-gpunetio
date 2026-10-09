@@ -437,6 +437,24 @@ the goal is physical port speed or end-to-end network performance.
 
 `daqiri_bench_raw_gpudirect` and `daqiri_bench_raw_hds` also accept `--workload none|fft|gemm|gemm_fp16`, which runs a representative GPU workload once per received reorder window on the **actual received packet data**: `fft` (batched cuFFT C2C transform), `gemm` (FP32 `cublasSgemm`), or `gemm_fp16` (the same-size mixed-precision FP16/tensor-core matmul that models inference). Each received burst's payloads are first reordered by sequence number into a contiguous GPU buffer (`examples/bench_pipeline.{h,cu}`) that the compute then consumes. `--workload-gemm-dim N` (default 1024) pins the square GEMM side length and `--workload-fft-len N` (default 1024) the 1-D FFT transform length, so the FLOP count per call stays constant as the I/O unit is swept. The same flags are honoured by the RoCE bench (`daqiri_bench_rdma`, in-order gather) and the socket bench (`daqiri_bench_socket`, host→device stage then UDP reorder / TCP gather). See the [DGX Spark GPU-workload results](performance-dgx-spark.md#two-link-receive-throughput-with-gpu-workloads).
 
+### GPUNetIO engine (experimental)
+
+With a build that includes `gpunetio` in `DAQIRI_ENGINE`, `daqiri_bench_raw_tx_rx_gpunetio.yaml`
+runs the same closed-loop test with CUDA kernels driving the NIC queues (DOCA GPUNetIO). Cable the
+TX port to the RX port, replace the placeholders, and run it as root:
+
+```bash
+sudo ./build/examples/daqiri_bench_raw_gpudirect \
+  examples/daqiri_bench_raw_tx_rx_gpunetio.yaml --seconds 10
+```
+
+Set the TX queue's `gpunetio.tx_kernel` to `persistent` (a resident kernel, several bursts in
+flight) or `per_burst` (one kernel launch per burst) to compare the two TX models. Measure with
+`mlnx_perf` as above. Keep `--workload none` for now: the workload modes free GPU memory with
+`cudaFree()` before shutdown, which waits for the engine's resident kernels. See the
+[GPUNetIO engine reference](../api-reference/configuration.md#gpunetio-engine) for the receive ring
+sizing and the packet ownership rules.
+
 ## Flow programming smoke test
 
 Raw Ethernet flow rules are programmed into the NIC during `daqiri_init()`. Software loopback

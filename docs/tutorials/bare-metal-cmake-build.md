@@ -276,7 +276,7 @@ need to enable a specific feature or adjust the build for a particular host.
 |---|---|---|
 | `CMAKE_BUILD_TYPE` | n/a | Use `Release` for benchmarks and installed builds. |
 | `BUILD_SHARED_LIBS` | n/a | Use `ON` to produce `libdaqiri.so` and exported package metadata; use `OFF` only when you intentionally need static libraries. |
-| `DAQIRI_ENGINE` | `"dpdk ibverbs"` | Space-separated optional engines to compile. Valid values are `dpdk` and `ibverbs`; Linux UDP/TCP sockets are always built in. Use a smaller set only when packaging a narrower build. |
+| `DAQIRI_ENGINE` | `"dpdk ibverbs"` | Space-separated optional engines to compile. Valid values are `dpdk`, `ibverbs`, and the experimental `gpunetio`; Linux UDP/TCP sockets are always built in. Use a smaller set only when packaging a narrower build. |
 | `DAQIRI_BUILD_EXAMPLES` | `ON` | Builds the `daqiri_bench_*` executables under `build/examples/`. Leave on for smoke tests and benchmark workflows. The `daqiri_config_validate` tool is always built and installed, including when this option is `OFF`. |
 | `DAQIRI_BUILD_APPLICATIONS` | `OFF` | Builds heavier end-to-end examples under `applications/`, currently the TensorRT ResNet inference app. Requires the extra application dependencies. |
 | `DAQIRI_BUILD_PYTHON` | `OFF` | Builds pybind11 Python bindings. Enable only when you need `import daqiri`. |
@@ -285,6 +285,7 @@ need to enable a specific feature or adjust the build for a particular host.
 | `DAQIRI_ENABLE_OTEL_METRICS` | `OFF` | Enables OpenTelemetry metrics instrumentation. Applications still configure the SDK reader/exporter. |
 | `DAQIRI_ENABLE_S3` | `OFF` | Enables AWS SDK-backed asynchronous raw packet writes to S3-compatible object stores. |
 | `DAQIRI_REORDER_GPU_PROFILE` | `OFF` | Adds CUDA event timing around reorder kernels. Enable only while profiling. |
+| `DAQIRI_DOCA_GPUNETIO_DEVICE_INCLUDE_DIR` | empty | DOCA GPUNetIO device headers with `doca_gpu_dev_eth_rxq_release()`, needed by the `gpunetio` engine until the installed DOCA provides it. |
 | `DAQIRI_PREFER_SYSTEM_YAML_CPP` | `OFF` | Prefer a system `yaml-cpp` instead of the vendored submodule. Keep `OFF` when a conda/miniforge environment is on `PATH`. |
 | `CMAKE_CUDA_ARCHITECTURES` | `80;90`, plus `121` with CUDA Toolkit 13.0+ | Override when your GPU is not covered by the default architecture list. |
 
@@ -293,7 +294,7 @@ guidance.
 
 ### `DAQIRI_ENGINE`: engine selection
 
-`DAQIRI_ENGINE` is a space-separated list controlling which **optional** engines are compiled into `libdaqiri.so`. Linux UDP/TCP sockets are always built in, so the only values are `dpdk` and `ibverbs`. Three recipes cover most use cases:
+`DAQIRI_ENGINE` is a space-separated list controlling which **optional** engines are compiled into `libdaqiri.so`. Linux UDP/TCP sockets are always built in, so the only values are `dpdk`, `ibverbs`, and the experimental `gpunetio`. Three recipes cover most use cases:
 
 | Recipe | What you get | When to use |
 |---|---|---|
@@ -304,6 +305,10 @@ guidance.
 !!! note "Sockets are always available; `ibverbs` backs RoCE"
 
     The socket engine (Linux UDP/TCP) is always built, so it never appears in `DAQIRI_ENGINE`. Its RoCE path delegates to the `ibverbs` engine, so `roce://` endpoints work only when `ibverbs` is in the list. Internally the ibverbs engine lives under [`src/engines/rdma`](https://github.com/NVIDIA/daqiri/blob/main/src/engines/rdma) (target `daqiri_rdma`); `ibverbs` is just the user-facing name, chosen so an alternative RDMA engine (such as DOCA) could be added later.
+
+!!! warning "`gpunetio` is experimental and needs DOCA 3.6 or newer"
+
+    Adding `gpunetio` (for example `-DDAQIRI_ENGINE="dpdk ibverbs gpunetio"`) builds the DOCA GPUNetIO raw Ethernet engine, which a stream selects with `engine: "gpunetio"`; it is never a default. CMake locates the DOCA 3.6+ GPUNetIO, Ethernet and Flow SDKs (`libdoca-sdk-gpunetio-dev`, `libdoca-sdk-eth-dev`, `libdoca-sdk-flow-dev`) with pkg-config under `/opt/mellanox/doca`, and fails at configure time when they are missing or older. The engine's CUDA kernels also need the deferred RX release of the DOCA GPUNetIO device API (`doca_gpu_dev_eth_rxq_release()`), which the installed DOCA may not ship yet: point `-DDAQIRI_DOCA_GPUNETIO_DEVICE_INCLUDE_DIR` at the `libs/doca_gpunetio/include/public` directory of a DOCA source tree that has it. These device headers are header-only and work with the installed DOCA libraries. Running the engine needs root, as DOCA Flow and the raw NIC queues do.
 
 ### `DAQIRI_BUILD_PYTHON`: pybind11 bindings
 

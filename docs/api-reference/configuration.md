@@ -54,9 +54,10 @@ These settings apply globally to both TX and RX:
   unless you need a specific implementation override. For `stream_type: "raw"` the
   default is `ibverbs`, which uses the Multi-Packet (striding) Receive Queue engine on
   Mellanox/mlx5 NICs; set `engine: "dpdk"` to use DPDK instead. RoCE configs infer `ibverbs` from
-  `roce://` endpoint URIs by default.
+  `roce://` endpoint URIs by default. `engine: "gpunetio"` selects the experimental DOCA GPUNetIO
+  raw engine, which is never a default; see [GPUNetIO engine](#gpunetio-engine).
   - type: `string`
-  - values: `dpdk`, `socket`, `ibverbs`
+  - values: `dpdk`, `socket`, `ibverbs`, `gpunetio`
 - **`log_level`**: Engine log level.
   - type: `string`
   - values: `trace`, `debug`, `info`, `warn` (default), `error`, `critical`, `off`
@@ -613,6 +614,13 @@ without an epoch field, an old late packet is indistinguishable from the same sl
   their device defaults.
   - type: `integer`
   - default: `0`
+- **`gpunetio.tx_kernel`**: How the `gpunetio` engine runs the CUDA kernel that posts this queue's
+  packets to the NIC. `persistent` keeps one resident kernel per queue that takes bursts from a
+  ring, with several bursts in flight. `per_burst` launches one kernel per `send_tx_burst()`; the
+  kernel waits for the NIC to send its burst, so bursts don't overlap. Accepted only with
+  `engine: "gpunetio"`.
+  - type: `string`
+  - values: `persistent` (default), `per_burst`
 
 A direct TX queue creates no handoff ring or worker. One application thread owns the queue and
 may have only one acquired-but-unsubmitted packet at a time. `BurstParams` remains the ownership
@@ -625,6 +633,38 @@ For the raw ibverbs engine, an equivalent `TxQueueConfig` can be passed to
 `add_tx_queue_async()` after initialization. The queue must reference existing memory regions and
 fit the metadata capacity reserved at initialization. Runtime TX queues require no flow rule;
 delete completion waits for submitted work and application-held allocations to be returned.
+
+### GPUNetIO engine
+
+`engine: "gpunetio"` (experimental) drives the NIC queues of a raw stream from CUDA kernels with
+DOCA GPUNetIO. Each RX queue runs a resident kernel that receives into its memory region and
+publishes bursts; each TX queue sends from its memory region with the kernel selected by
+`gpunetio.tx_kernel`. One CPU thread per queue, on the queue's `cpu_core`, moves bursts between the
+kernels and the application.
+
+- **Receive ring:** the single memory region of an RX queue becomes the NIC receive ring and can't
+  be shared with another queue. Its slots are rounded up to a power of two up to 8 kB, and its
+  `num_bufs` to a power of two of at least 512 and at least `batch_size`. A received packet bigger
+  than a slot stops the queue, so keep the port MTU below the slot size.
+- **Ownership:** received packets stay valid until the application frees their burst with
+  `free_all_packets()` (or `free_packet()` for each packet); only then does the NIC reuse their
+  slots. Bursts can be freed in any order, but slots return to the NIC in arrival order, so a
+  burst held for long blocks the reuse of the newer ones. When the ring is full the NIC drops
+  incoming packets.
+- **Bursts:** a burst holds `batch_size` packets, except at the end of the ring and when
+  `timeout_us` elapses first. The packet pointers point into the region, and the lengths into
+  pinned host memory.
+- **Steering:** DOCA Flow matches the RX flows (IPv4/UDP or Ethernet fields) in configuration
+  order, and spreads a flow with several queue IDs over them. With `flow_isolation: true`,
+  unmatched packets go to the kernel, otherwise to the first RX queue.
+- **Not supported:** header-data split, memory regions other than `device` and `host_pinned`,
+  caller-owned memory regions, software and hardware loopback, TX offloads, `pacing_mbps`,
+  `accurate_send`, `hardware_timestamps`, per-packet flow IDs (reported as `0`), dynamic and runtime
+  flows, runtime resources, flex items, eCPRI matches, reorder, and direct polling.
+- **CUDA:** the resident kernels run until `shutdown()`. `cudaDeviceSynchronize()` and
+  `cudaFree()` of a valid pointer wait for every running kernel, so they block until then:
+  synchronize streams instead, and free device memory with `cudaFreeAsync()` or after
+  `shutdown()`. `cudaMalloc()`, `cudaMemcpy()` and work on other streams are not affected.
 
 ### Transmit Flows
 

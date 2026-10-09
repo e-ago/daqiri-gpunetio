@@ -830,6 +830,11 @@ Status daqiri_init(NetworkConfig& config, const MemoryRegionBindings& bindings) 
     }
   }
 
+  if (config.common_.engine_type == EngineType::GPUNETIO && !bindings.empty()) {
+    DAQIRI_LOG_ERROR("The gpunetio engine does not support caller-owned memory regions yet");
+    return Status::NOT_SUPPORTED;
+  }
+
   EngineFactory::set_engine_type(config.common_.engine_type);
 
   auto engine = &(EngineFactory::get_active_engine());
@@ -982,6 +987,10 @@ Status get_memory_region_requirements(const NetworkConfig& config,
   const EngineType engine = effective_engine_type(config);
   if (engine == EngineType::SOCKET && config.common_.protocol != SocketProtocol::ROCE) {
     DAQIRI_LOG_ERROR("Direct TCP/UDP socket streams do not use configured memory-region pools");
+    return Status::NOT_SUPPORTED;
+  }
+  if (engine == EngineType::GPUNETIO) {
+    DAQIRI_LOG_ERROR("The gpunetio engine does not support caller-owned memory regions yet");
     return Status::NOT_SUPPORTED;
   }
 
@@ -2404,7 +2413,7 @@ bool YAML::convert<daqiri::NetworkConfig>::parse_tx_queue_config(
   if (!daqiri::detail::validate_yaml_mapping_keys(
           q_item,
           {"name", "id", "poll_mode", "cpu_core", "batch_size", "memory_regions", "offloads",
-           "pacing_mbps", "timeout_us"},
+           "pacing_mbps", "timeout_us", "gpunetio"},
           "TX queue")) {
     return false;
   }
@@ -2448,6 +2457,30 @@ bool YAML::convert<daqiri::NetworkConfig>::parse_tx_queue_config(
     if (!parse_tx_queue_common_config(q_item, q, parse_memory_regions,
                                       q.poll_mode_ == daqiri::QueuePollMode::INDIRECT)) {
       return false;
+    }
+
+    if (q_item["gpunetio"].IsDefined()) {
+      const auto& gpunetio = q_item["gpunetio"];
+      if (_engine_type != daqiri::EngineType::GPUNETIO) {
+        DAQIRI_LOG_ERROR("TX queue '{}' sets gpunetio options, which need engine 'gpunetio'",
+                         q.common_.name_);
+        return false;
+      }
+      if (!daqiri::detail::validate_yaml_mapping_keys(gpunetio, {"tx_kernel"},
+                                                      "TX queue gpunetio")) {
+        return false;
+      }
+      if (gpunetio["tx_kernel"].IsDefined()) {
+        const auto tx_kernel = gpunetio["tx_kernel"].as<std::string>();
+        q.gpunetio_tx_kernel_ = daqiri::gpunetio_tx_kernel_from_string(tx_kernel);
+        if (q.gpunetio_tx_kernel_ == daqiri::GpunetioTxKernel::INVALID) {
+          DAQIRI_LOG_ERROR(
+              "TX queue '{}' has an invalid gpunetio tx_kernel '{}'; valid values "
+              "are persistent and per_burst",
+              q.common_.name_, tx_kernel);
+          return false;
+        }
+      }
     }
 
   } catch (const std::exception& e) {
