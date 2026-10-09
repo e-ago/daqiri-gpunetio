@@ -285,7 +285,6 @@ need to enable a specific feature or adjust the build for a particular host.
 | `DAQIRI_ENABLE_OTEL_METRICS` | `OFF` | Enables OpenTelemetry metrics instrumentation. Applications still configure the SDK reader/exporter. |
 | `DAQIRI_ENABLE_S3` | `OFF` | Enables AWS SDK-backed asynchronous raw packet writes to S3-compatible object stores. |
 | `DAQIRI_REORDER_GPU_PROFILE` | `OFF` | Adds CUDA event timing around reorder kernels. Enable only while profiling. |
-| `DAQIRI_DOCA_GPUNETIO_DEVICE_INCLUDE_DIR` | empty | DOCA GPUNetIO device headers with `doca_gpu_dev_eth_rxq_release()`, needed by the `gpunetio` engine until the installed DOCA provides it. |
 | `DAQIRI_PREFER_SYSTEM_YAML_CPP` | `OFF` | Prefer a system `yaml-cpp` instead of the vendored submodule. Keep `OFF` when a conda/miniforge environment is on `PATH`. |
 | `CMAKE_CUDA_ARCHITECTURES` | `80;90`, plus `121` with CUDA Toolkit 13.0+ | Override when your GPU is not covered by the default architecture list. |
 
@@ -308,7 +307,7 @@ guidance.
 
 !!! warning "`gpunetio` is experimental and needs DOCA 3.6 or newer"
 
-    Adding `gpunetio` (for example `-DDAQIRI_ENGINE="dpdk ibverbs gpunetio"`) builds the DOCA GPUNetIO raw Ethernet engine, which a stream selects with `engine: "gpunetio"`; it is never a default. CMake locates the DOCA 3.6+ GPUNetIO, Ethernet and Flow SDKs (`libdoca-sdk-gpunetio-dev`, `libdoca-sdk-eth-dev`, `libdoca-sdk-flow-dev`) with pkg-config under `/opt/mellanox/doca`, and fails at configure time when they are missing or older. The engine's CUDA kernels also need the deferred RX release of the DOCA GPUNetIO device API (`doca_gpu_dev_eth_rxq_release()`), which the installed DOCA may not ship yet: point `-DDAQIRI_DOCA_GPUNETIO_DEVICE_INCLUDE_DIR` at the `libs/doca_gpunetio/include/public` directory of a DOCA source tree that has it. These device headers are header-only and work with the installed DOCA libraries. Running the engine needs root, as DOCA Flow and the raw NIC queues do.
+    Adding `gpunetio` (for example `-DDAQIRI_ENGINE="dpdk ibverbs gpunetio"`) builds the DOCA GPUNetIO raw Ethernet engine, which a stream selects with `engine: "gpunetio"`; it is never a default. CMake locates the DOCA 3.6+ GPUNetIO, Ethernet and Flow SDKs (`libdoca-sdk-gpunetio-dev`, `libdoca-sdk-eth-dev`, `libdoca-sdk-flow-dev`) with pkg-config under `/opt/mellanox/doca`, and fails at configure time when they are missing or older. Running the engine needs root, as DOCA Flow and the raw NIC queues do.
 
 ### `DAQIRI_BUILD_PYTHON`: pybind11 bindings
 

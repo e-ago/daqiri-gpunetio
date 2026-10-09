@@ -253,8 +253,6 @@ RUN if [ "${TARGETARCH}" = "amd64" ]; then \
 # - libdoca-sdk-gpunetio-dev: DOCA GPUNetIO (GPU datapath of the NIC queues)
 # - libdoca-sdk-eth-dev: DOCA Ethernet RX/TX queues
 # - libdoca-sdk-flow-dev: DOCA Flow, steers received packets to the RX queues
-# The engine also needs the deferred RX release of the DOCA GPUNetIO device API; until the DOCA
-# release installed here ships it, configure with DAQIRI_DOCA_GPUNETIO_DEVICE_INCLUDE_DIR.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libdoca-sdk-gpunetio-dev \
         libdoca-sdk-eth-dev \
