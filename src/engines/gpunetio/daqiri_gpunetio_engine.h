@@ -32,12 +32,12 @@ namespace daqiri {
 /**
  * @brief Raw-Ethernet engine built on DOCA GPUNetIO (stream_type: raw, engine: gpunetio)
  *
- * CUDA kernels drive the NIC queues. Each RX queue has a resident kernel that receives into a
- * ring in the queue's memory region and publishes bursts; the buffers of a burst go back to the
- * NIC only when the application frees it. Each TX queue sends from
- * cyclic slots in its memory region, either with a resident kernel or with one kernel launch per
- * burst (TX queue option gpunetio.tx_kernel). One CPU thread per queue moves bursts between the
- * kernels and the application.
+ * CUDA kernels drive the NIC queues. On each GPU, one resident RX kernel serves all the RX queues,
+ * one block per queue: a block receives into a ring in its queue's memory region and publishes
+ * bursts, and the buffers of a burst go back to the NIC only when the application frees it. Each
+ * TX queue sends from cyclic slots in its memory region, either from a block of the GPU's resident
+ * TX kernel or with one kernel launch per burst (TX queue option gpunetio.tx_kernel). One CPU
+ * thread per queue moves bursts between the kernels and the application.
  */
 class GpunetioEngine : public Engine {
  public:

@@ -615,8 +615,9 @@ without an epoch field, an old late packet is indistinguishable from the same sl
   - type: `integer`
   - default: `0`
 - **`gpunetio.tx_kernel`**: How the `gpunetio` engine runs the CUDA kernel that posts this queue's
-  packets to the NIC. `persistent` keeps one resident kernel per queue that takes bursts from a
-  ring, with several bursts in flight. `per_burst` launches one kernel per `send_tx_burst()`; the
+  packets to the NIC. `persistent` serves the queue from a block of a resident kernel that takes
+  bursts from a ring, with several bursts in flight; one such kernel per GPU runs a block for each
+  of its persistent queues. `per_burst` launches one kernel per `send_tx_burst()`; the
   kernel waits for the NIC to send its burst, so bursts don't overlap. Accepted only with
   `engine: "gpunetio"`.
   - type: `string`
@@ -637,10 +638,10 @@ delete completion waits for submitted work and application-held allocations to b
 ### GPUNetIO engine
 
 `engine: "gpunetio"` (experimental) drives the NIC queues of a raw stream from CUDA kernels with
-DOCA GPUNetIO. Each RX queue runs a resident kernel that receives into its memory region and
-publishes bursts; each TX queue sends from its memory region with the kernel selected by
-`gpunetio.tx_kernel`. One CPU thread per queue, on the queue's `cpu_core`, moves bursts between the
-kernels and the application.
+DOCA GPUNetIO. On each GPU, one resident RX kernel serves all the RX queues with one CUDA block
+per queue; a block receives into its queue's memory region and publishes bursts. Each TX queue
+sends from its memory region with the kernel selected by `gpunetio.tx_kernel`. One CPU thread per
+queue, on the queue's `cpu_core`, moves bursts between the kernels and the application.
 
 - **Receive ring:** the single memory region of an RX queue becomes the NIC receive ring and can't
   be shared with another queue. Its slots are rounded up to a power of two up to 8 kB, and its
@@ -661,10 +662,14 @@ kernels and the application.
   caller-owned memory regions, software and hardware loopback, TX offloads, `pacing_mbps`,
   `accurate_send`, `hardware_timestamps`, per-packet flow IDs (reported as `0`), dynamic and runtime
   flows, runtime resources, flex items, eCPRI matches, reorder, and direct polling.
-- **CUDA:** the resident kernels run until `shutdown()`. `cudaDeviceSynchronize()` and
+- **CUDA:** the resident kernels run until `shutdown()`, and the GPU must run all their blocks at
+  once: `daqiri_init()` fails if it can't fit one block per queue. `cudaDeviceSynchronize()` and
   `cudaFree()` of a valid pointer wait for every running kernel, so they block until then:
   synchronize streams instead, and free device memory with `cudaFreeAsync()` or after
-  `shutdown()`. `cudaMalloc()`, `cudaMemcpy()` and work on other streams are not affected.
+  `shutdown()`. With CUDA lazy loading, the default, the first launch of an application kernel
+  after `daqiri_init()` blocks the same way: set `CUDA_MODULE_LOADING=EAGER`, or load the kernels
+  before `daqiri_init()`, for example with `cudaFuncGetAttributes()`. `cudaMalloc()`,
+  `cudaMemcpy()` and work on other streams are not affected.
 
 ### Transmit Flows
 

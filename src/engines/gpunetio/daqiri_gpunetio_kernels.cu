@@ -164,11 +164,13 @@ __device__ void rx_release(doca_gpu_eth_rxq* rxq, uint64_t num_pkts, uint64_t* p
 }
 
 /*
- * One block receives from one queue for the lifetime of the engine. A packet stays valid until the
- * application frees its burst: the CPU reports the freed packets through ctrl->released_pkts, and
- * only then does the kernel give their buffers back to the NIC.
+ * One block per RX queue of the GPU: block i receives from queues[i] for the lifetime of the
+ * engine. A packet stays valid until the application frees its burst: the CPU reports the freed
+ * packets through ctrl->released_pkts, and only then does the kernel give their buffers back to
+ * the NIC.
  */
-__global__ void __launch_bounds__(RX_THREADS) rx_kernel(RxKernelArgs args) {
+__global__ void __launch_bounds__(RX_THREADS) rx_kernel(const RxKernelArgs* queues) {
+  const RxKernelArgs args = queues[blockIdx.x];
   __shared__ uint64_t first_slot;
   __shared__ uint64_t received;  // Sequence number of the next packet; ring slot = sequence % size
   __shared__ uint32_t started;   // The first packet set the sequence
@@ -396,8 +398,10 @@ __device__ void tx_save_state(const TxKernelArgs& args, const TxRun& run) {
   args.state->bursts_done = run.bursts_done;
 }
 
-// One block serves one TX queue for the lifetime of the engine, several bursts in flight
-__global__ void __launch_bounds__(TX_THREADS) tx_persistent_kernel(TxKernelArgs args) {
+// One block per persistent TX queue of the GPU: block i serves queues[i] for the lifetime of the
+// engine, several bursts in flight
+__global__ void __launch_bounds__(TX_THREADS) tx_persistent_kernel(const TxKernelArgs* queues) {
+  const TxKernelArgs args = queues[blockIdx.x];
   __shared__ TxRun run;
   __shared__ uint64_t slot_start;
   __shared__ uint32_t num_pkts;
@@ -471,19 +475,61 @@ __global__ void __launch_bounds__(TX_THREADS)
   }
 }
 
+// The blocks of a resident kernel never return, so the GPU must run all of them at once: a block
+// waiting for room would leave its queue unserved
+template <typename Kernel>
+cudaError_t check_resident(Kernel kernel, uint32_t threads, uint32_t blocks) {
+  int device = 0;
+  int sms = 0;
+  int per_sm = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err == cudaSuccess) {
+    err = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  }
+  if (err == cudaSuccess) {
+    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, 0);
+  }
+  if (err != cudaSuccess) {
+    return err;
+  }
+  return static_cast<uint64_t>(per_sm) * sms >= blocks ? cudaSuccess
+                                                       : cudaErrorLaunchOutOfResources;
+}
+
 }  // namespace
 
 uint32_t rx_kernel_threads() {
   return RX_THREADS;
 }
 
-cudaError_t launch_rx_kernel(const RxKernelArgs& args, cudaStream_t stream) {
-  rx_kernel<<<1, RX_THREADS, 0, stream>>>(args);
+cudaError_t load_kernels() {
+  cudaFuncAttributes attr;
+  cudaError_t err = cudaFuncGetAttributes(&attr, rx_kernel);
+  if (err == cudaSuccess) {
+    err = cudaFuncGetAttributes(&attr, tx_persistent_kernel);
+  }
+  if (err == cudaSuccess) {
+    err = cudaFuncGetAttributes(&attr, tx_burst_kernel);
+  }
+  return err;
+}
+
+cudaError_t launch_rx_kernel(const RxKernelArgs* queues, uint32_t num_queues, cudaStream_t stream) {
+  const cudaError_t err = check_resident(rx_kernel, RX_THREADS, num_queues);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  rx_kernel<<<num_queues, RX_THREADS, 0, stream>>>(queues);
   return cudaGetLastError();
 }
 
-cudaError_t launch_tx_persistent_kernel(const TxKernelArgs& args, cudaStream_t stream) {
-  tx_persistent_kernel<<<1, TX_THREADS, 0, stream>>>(args);
+cudaError_t launch_tx_persistent_kernel(const TxKernelArgs* queues, uint32_t num_queues,
+                                        cudaStream_t stream) {
+  const cudaError_t err = check_resident(tx_persistent_kernel, TX_THREADS, num_queues);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  tx_persistent_kernel<<<num_queues, TX_THREADS, 0, stream>>>(queues);
   return cudaGetLastError();
 }
 

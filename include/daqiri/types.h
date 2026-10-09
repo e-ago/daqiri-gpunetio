@@ -733,7 +733,7 @@ struct RxQueueConfig {
 
 // How the gpunetio engine runs the CUDA kernel that posts the packets of a TX queue to the NIC
 enum class GpunetioTxKernel {
-  PERSISTENT,  // one resident kernel per queue takes bursts from a ring, several bursts in flight
+  PERSISTENT,  // a block of a resident kernel takes bursts from a ring, several bursts in flight
   PER_BURST,   // one kernel launch per send_tx_burst(), which waits for the NIC to send the burst
   INVALID,
 };

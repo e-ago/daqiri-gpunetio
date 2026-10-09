@@ -117,8 +117,18 @@ struct TxKernelArgs {
 // Threads of the RX kernel block
 uint32_t rx_kernel_threads();
 
-cudaError_t launch_rx_kernel(const RxKernelArgs& args, cudaStream_t stream);
-cudaError_t launch_tx_persistent_kernel(const TxKernelArgs& args, cudaStream_t stream);
+// Loads every kernel on the current CUDA device. With CUDA lazy loading, the default, a kernel
+// launched for the first time while a resident kernel runs doesn't start until that kernel exits,
+// so call it before the first resident kernel starts.
+cudaError_t load_kernels();
+
+// The resident kernels run one block per queue, block i serving queues[i]. queues holds
+// num_queues entries in memory the GPU reads, and stays valid while the kernel runs. The launch
+// fails with cudaErrorLaunchOutOfResources if the GPU can't run all the blocks at once.
+cudaError_t launch_rx_kernel(const RxKernelArgs* queues, uint32_t num_queues, cudaStream_t stream);
+cudaError_t launch_tx_persistent_kernel(const TxKernelArgs* queues, uint32_t num_queues,
+                                        cudaStream_t stream);
+// One block sending one burst of one queue
 cudaError_t launch_tx_burst_kernel(const TxKernelArgs& args, uint64_t slot_start, uint32_t num_pkts,
                                    cudaStream_t stream);
 

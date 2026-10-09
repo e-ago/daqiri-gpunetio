@@ -180,6 +180,31 @@ bool wait_stream(cudaStream_t stream) {
   return true;
 }
 
+// Launches a resident kernel on a new stream, one block per queue. The kernel reads the arguments
+// of its blocks from pinned host memory.
+template <typename Args, typename Launch>
+bool launch_resident_kernel(const char* name, int ordinal, const std::vector<Args>& blocks,
+                            Args** args, cudaStream_t* stream, Launch launch) {
+  if (blocks.empty()) {
+    return true;
+  }
+  *args = alloc_pinned<Args>(blocks.size());
+  if (*args == nullptr || cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking) != cudaSuccess) {
+    DAQIRI_LOG_CRITICAL("GPU {}: could not allocate the {} kernel resources", ordinal, name);
+    return false;
+  }
+  std::copy(blocks.begin(), blocks.end(), *args);
+  const cudaError_t err = launch(*args, static_cast<uint32_t>(blocks.size()), *stream);
+  if (err != cudaSuccess) {
+    DAQIRI_LOG_CRITICAL("GPU {}: {} kernel launch for {} queue(s) failed: {}", ordinal, name,
+                        blocks.size(), cudaGetErrorString(err));
+    return false;
+  }
+  DAQIRI_LOG_INFO("GPU {}: {} kernel running with {} block(s), one per queue", ordinal, name,
+                  blocks.size());
+  return true;
+}
+
 uint32_t doca_sdk_log_level(LogLevel::Level level) {
   switch (level) {
     case LogLevel::TRACE:
@@ -265,10 +290,18 @@ struct GpunetioEngine::Device {
   int tx_port = -1;                           // Interface with TX queues on this NIC
 };
 
+// GPU running the datapath. One resident RX kernel serves all the RX queues of the GPU, and one
+// resident TX kernel its persistent TX queues, one block per queue. Each kernel has its own stream:
+// on a shared stream, the second kernel would wait for the first to exit.
 struct GpunetioEngine::Gpu {
   int ordinal = -1;
   int cc_major = 0;
   struct doca_gpu* gpu = nullptr;
+
+  gpunetio::RxKernelArgs* rx_args = nullptr;  // Pinned host memory, one entry per block
+  gpunetio::TxKernelArgs* tx_args = nullptr;
+  cudaStream_t rx_stream = nullptr;
+  cudaStream_t tx_stream = nullptr;
 };
 
 // Registration of a memory region with the NICs of the queues using it
@@ -304,9 +337,7 @@ struct GpunetioEngine::RxQueue {
   gpunetio::RxControl* ctrl = nullptr;
   gpunetio::RxBurstDesc* desc = nullptr;  // ring_size entries
   uint32_t* pkt_len = nullptr;            // ring_size entries
-  uint32_t max_pkts = 0;                  // Packets per receive call
-  cudaStream_t stream = nullptr;
-  bool kernel_launched = false;
+  gpunetio::RxKernelArgs kernel_args{};   // The queue's block in the RX kernel of its GPU
   bool kernel_stuck = false;
 
   // Burst bookkeeping. Descriptors are released in order: the worker advances the release
@@ -360,8 +391,9 @@ struct GpunetioEngine::TxQueue {
   gpunetio::TxBurstDesc* desc = nullptr;
   gpunetio::TxControl* ctrl = nullptr;
   gpunetio::TxState* state = nullptr;
-  cudaStream_t stream = nullptr;
-  bool kernel_launched = false;
+  // The queue's block in the persistent TX kernel of its GPU, or its per-burst launches
+  gpunetio::TxKernelArgs kernel_args{};
+  cudaStream_t stream = nullptr;  // per_burst only
   bool kernel_stuck = false;
 
   daqiri::Ring* send_ring = nullptr;  // Bursts sent by the application
@@ -900,15 +932,22 @@ bool GpunetioEngine::create_rx_queue(RxQueue& q) {
   q.ctrl = alloc_pinned<gpunetio::RxControl>(1);
   q.desc = alloc_pinned<gpunetio::RxBurstDesc>(q.ring_size);
   q.pkt_len = alloc_pinned<uint32_t>(q.ring_size);
-  const uint32_t threads = gpunetio::rx_kernel_threads();
-  q.max_pkts = static_cast<uint32_t>(
-      std::min<uint64_t>(round_up(std::max<uint32_t>(q.batch_size, 1), threads),
-                         round_up(RX_MAX_PKTS_PER_CALL, threads)));
-  if (q.ctrl == nullptr || q.desc == nullptr || q.pkt_len == nullptr ||
-      cudaStreamCreateWithFlags(&q.stream, cudaStreamNonBlocking) != cudaSuccess) {
+  if (q.ctrl == nullptr || q.desc == nullptr || q.pkt_len == nullptr) {
     DAQIRI_LOG_CRITICAL("RX queue '{}': could not allocate the kernel resources", q.name);
     return false;
   }
+  const uint32_t threads = gpunetio::rx_kernel_threads();
+  gpunetio::RxKernelArgs& args = q.kernel_args;
+  args.rxq = q.gpu_rxq;
+  args.desc = q.desc;
+  args.pkt_len = q.pkt_len;
+  args.ctrl = q.ctrl;
+  args.ring_mask = q.ring_size - 1;
+  args.timeout_ns = q.timeout_ns;
+  args.desc_mask = static_cast<uint32_t>(q.ring_size - 1);
+  args.batch_size = std::max<uint32_t>(q.batch_size, 1);
+  args.max_pkts = static_cast<uint32_t>(std::min<uint64_t>(
+      round_up(args.batch_size, threads), round_up(RX_MAX_PKTS_PER_CALL, threads)));
 
   // At most ring_size descriptors are outstanding, as each holds at least one packet
   q.ring = daqiri::Ring::create("gpunetio_rx", static_cast<unsigned>(q.ring_size) + 1,
@@ -1009,10 +1048,21 @@ bool GpunetioEngine::create_tx_queue(TxQueue& q) {
   if (q.pkts == nullptr || q.desc == nullptr || q.ctrl == nullptr ||
       cudaMalloc(&q.state, sizeof(gpunetio::TxState)) != cudaSuccess ||
       cudaMemcpy(q.state, &state, sizeof(state), cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaStreamCreateWithFlags(&q.stream, cudaStreamNonBlocking) != cudaSuccess) {
+      (q.kernel == GpunetioTxKernel::PER_BURST &&
+       cudaStreamCreateWithFlags(&q.stream, cudaStreamNonBlocking) != cudaSuccess)) {
     DAQIRI_LOG_CRITICAL("TX queue '{}': could not allocate the kernel resources", q.name);
     return false;
   }
+  gpunetio::TxKernelArgs& args = q.kernel_args;
+  args.txq = q.gpu_txq;
+  args.pkts = q.pkts;
+  args.desc = q.desc;
+  args.ctrl = q.ctrl;
+  args.state = q.state;
+  args.num_slots = q.num_slots;
+  args.desc_mask = TX_DESC_RING - 1;
+  args.mkey = q.mkey;
+  args.max_chunk = q.max_chunk;
   q.send_ring = daqiri::Ring::create("gpunetio_tx", TX_SEND_RING, daqiri::RingMode::MPMC);
   if (q.send_ring == nullptr) {
     DAQIRI_LOG_CRITICAL("TX queue '{}': could not allocate the send ring", q.name);
@@ -1230,59 +1280,60 @@ bool GpunetioEngine::create_burst_pools() {
   return true;
 }
 
+// On each GPU, one RX kernel with a block per RX queue and one TX kernel with a block per
+// persistent TX queue. The per_burst TX queues launch their kernels from their worker.
 bool GpunetioEngine::start_kernels() {
-  for (auto& q : rx_queues_) {
-    gpunetio::RxKernelArgs args{};
-    args.rxq = q->gpu_rxq;
-    args.desc = q->desc;
-    args.pkt_len = q->pkt_len;
-    args.ctrl = q->ctrl;
-    args.ring_mask = q->ring_size - 1;
-    args.timeout_ns = q->timeout_ns;
-    args.desc_mask = static_cast<uint32_t>(q->ring_size - 1);
-    args.batch_size = std::max<uint32_t>(q->batch_size, 1);
-    args.max_pkts = q->max_pkts;
-    if (!select_cuda_device(q->gpu->ordinal, "launching the RX kernel")) {
+  // Under CUDA lazy loading, a kernel launched for the first time waits for the running kernels to
+  // exit, and the resident kernels exit only at shutdown: load every kernel of the engine first
+  for (auto& [ordinal, gpu] : gpus_) {
+    if (!select_cuda_device(ordinal, "loading the gpunetio kernels")) {
       return false;
     }
-    const cudaError_t err = gpunetio::launch_rx_kernel(args, q->stream);
+    const cudaError_t err = gpunetio::load_kernels();
     if (err != cudaSuccess) {
-      DAQIRI_LOG_CRITICAL("RX queue '{}': kernel launch failed: {}", q->name,
+      DAQIRI_LOG_CRITICAL("GPU {}: could not load the gpunetio kernels: {}", ordinal,
                           cudaGetErrorString(err));
       return false;
     }
-    q->kernel_launched = true;
   }
-  for (auto& q : tx_queues_) {
-    if (q->kernel != GpunetioTxKernel::PERSISTENT) {
-      continue;
+  const bool resident =
+      !rx_queues_.empty() || std::any_of(tx_queues_.begin(), tx_queues_.end(), [](const auto& q) {
+        return q->kernel == GpunetioTxKernel::PERSISTENT;
+      });
+  const char* loading = std::getenv("CUDA_MODULE_LOADING");
+  if (resident && (loading == nullptr || std::strcmp(loading, "EAGER") != 0)) {
+    DAQIRI_LOG_WARN(
+        "CUDA lazy loading is on: a kernel the application launches for the first time after "
+        "daqiri_init() blocks until shutdown. Set CUDA_MODULE_LOADING=EAGER, or load the "
+        "application kernels before daqiri_init() with cudaFuncGetAttributes().");
+  }
+
+  for (auto& [ordinal, gpu] : gpus_) {
+    std::vector<gpunetio::RxKernelArgs> rx_blocks;
+    for (const auto& q : rx_queues_) {
+      if (q->gpu == gpu.get()) {
+        rx_blocks.push_back(q->kernel_args);
+      }
     }
-    gpunetio::TxKernelArgs args{};
-    args.txq = q->gpu_txq;
-    args.pkts = q->pkts;
-    args.desc = q->desc;
-    args.ctrl = q->ctrl;
-    args.state = q->state;
-    args.num_slots = q->num_slots;
-    args.desc_mask = TX_DESC_RING - 1;
-    args.mkey = q->mkey;
-    args.max_chunk = q->max_chunk;
-    if (!select_cuda_device(q->gpu->ordinal, "launching the TX kernel")) {
+    std::vector<gpunetio::TxKernelArgs> tx_blocks;
+    for (const auto& q : tx_queues_) {
+      if (q->gpu == gpu.get() && q->kernel == GpunetioTxKernel::PERSISTENT) {
+        tx_blocks.push_back(q->kernel_args);
+      }
+    }
+    if (!select_cuda_device(ordinal, "launching the gpunetio kernels") ||
+        !launch_resident_kernel("RX", ordinal, rx_blocks, &gpu->rx_args, &gpu->rx_stream,
+                                gpunetio::launch_rx_kernel) ||
+        !launch_resident_kernel("TX", ordinal, tx_blocks, &gpu->tx_args, &gpu->tx_stream,
+                                gpunetio::launch_tx_persistent_kernel)) {
       return false;
     }
-    const cudaError_t err = gpunetio::launch_tx_persistent_kernel(args, q->stream);
-    if (err != cudaSuccess) {
-      DAQIRI_LOG_CRITICAL("TX queue '{}': kernel launch failed: {}", q->name,
-                          cudaGetErrorString(err));
-      return false;
-    }
-    q->kernel_launched = true;
   }
   return true;
 }
 
-// Asks the resident kernels to exit and waits for every queue stream to drain. A kernel that
-// doesn't stop keeps its queue alive: destroying it under a running kernel would fault the GPU.
+// Asks the kernels to exit and waits for their streams to drain. The queues of a kernel that
+// doesn't stop stay alive: destroying them under a running kernel would fault the GPU.
 void GpunetioEngine::stop_kernels() {
   for (auto& q : rx_queues_) {
     if (q->ctrl != nullptr) {
@@ -1294,10 +1345,24 @@ void GpunetioEngine::stop_kernels() {
       store_release(&q->ctrl->exit, 1u);
     }
   }
-  for (auto& q : rx_queues_) {
-    if (q->stream != nullptr && !wait_stream(q->stream)) {
-      q->kernel_stuck = true;
-      DAQIRI_LOG_CRITICAL("RX queue '{}': the kernel did not stop", q->name);
+  for (auto& [ordinal, gpu] : gpus_) {
+    const bool rx_stuck = gpu->rx_stream != nullptr && !wait_stream(gpu->rx_stream);
+    const bool tx_stuck = gpu->tx_stream != nullptr && !wait_stream(gpu->tx_stream);
+    if (rx_stuck) {
+      DAQIRI_LOG_CRITICAL("GPU {}: the RX kernel did not stop", ordinal);
+    }
+    if (tx_stuck) {
+      DAQIRI_LOG_CRITICAL("GPU {}: the TX kernel did not stop", ordinal);
+    }
+    for (auto& q : rx_queues_) {
+      if (q->gpu == gpu.get() && rx_stuck) {
+        q->kernel_stuck = true;
+      }
+    }
+    for (auto& q : tx_queues_) {
+      if (q->gpu == gpu.get() && q->kernel == GpunetioTxKernel::PERSISTENT && tx_stuck) {
+        q->kernel_stuck = true;
+      }
     }
   }
   for (auto& q : tx_queues_) {
@@ -1419,17 +1484,6 @@ void GpunetioEngine::tx_worker(TxQueue* q) {
   const uint32_t max_inflight =
       q->kernel == GpunetioTxKernel::PERSISTENT ? TX_DESC_RING : TX_LAUNCHES_IN_FLIGHT;
 
-  gpunetio::TxKernelArgs args{};
-  args.txq = q->gpu_txq;
-  args.pkts = q->pkts;
-  args.desc = q->desc;
-  args.ctrl = q->ctrl;
-  args.state = q->state;
-  args.num_slots = q->num_slots;
-  args.desc_mask = TX_DESC_RING - 1;
-  args.mkey = q->mkey;
-  args.max_chunk = q->max_chunk;
-
   while (workers_running_.load(std::memory_order_relaxed)) {
     bool busy = false;
 
@@ -1461,7 +1515,8 @@ void GpunetioEngine::tx_worker(TxQueue* q) {
         desc.num_pkts = num;
         store_release(&desc.ready, static_cast<uint32_t>(q->published + 1));
       } else {
-        const cudaError_t err = gpunetio::launch_tx_burst_kernel(args, priv.seq, num, q->stream);
+        const cudaError_t err =
+            gpunetio::launch_tx_burst_kernel(q->kernel_args, priv.seq, num, q->stream);
         if (err != cudaSuccess) {
           DAQIRI_LOG_ERROR("TX queue '{}': kernel launch failed: {}", q->name,
                            cudaGetErrorString(err));
@@ -1548,9 +1603,6 @@ void GpunetioEngine::shutdown() {
       if (q->pkt_len != nullptr) {
         cudaFreeHost(q->pkt_len);
       }
-      if (q->stream != nullptr) {
-        cudaStreamDestroy(q->stream);
-      }
     }
     daqiri::Ring::free(q->ring);
   }
@@ -1609,6 +1661,18 @@ void GpunetioEngine::shutdown() {
   }
   if (!stuck) {
     for (auto& [ordinal, gpu] : gpus_) {
+      if (gpu->rx_stream != nullptr) {
+        cudaStreamDestroy(gpu->rx_stream);
+      }
+      if (gpu->tx_stream != nullptr) {
+        cudaStreamDestroy(gpu->tx_stream);
+      }
+      if (gpu->rx_args != nullptr) {
+        cudaFreeHost(gpu->rx_args);
+      }
+      if (gpu->tx_args != nullptr) {
+        cudaFreeHost(gpu->tx_args);
+      }
       if (gpu->gpu != nullptr) {
         (void)doca_gpu_destroy(gpu->gpu);
       }
