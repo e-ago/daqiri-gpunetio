@@ -54,9 +54,13 @@ These settings apply globally to both TX and RX:
   unless you need a specific implementation override. For `stream_type: "raw"` the
   default is `ibverbs`, which uses the Multi-Packet (striding) Receive Queue engine on
   Mellanox/mlx5 NICs; set `engine: "dpdk"` to use DPDK instead. RoCE configs infer `ibverbs` from
-  `roce://` endpoint URIs by default.
+  `roce://` endpoint URIs by default. `engine: "gpunetio_verbs"` selects the experimental engines
+  whose NIC queues are driven by CUDA kernels, which are never a default. As `ibverbs` does, it
+  selects one engine per stream type: the [GPUNetIO Verbs engine](#gpunetio-verbs-engine) for
+  `stream_type: "raw"`, and the [GPUNetIO Verbs RoCE engine](#gpunetio-verbs-roce-engine) for
+  `stream_type: "socket"` with `roce://` endpoints.
   - type: `string`
-  - values: `dpdk`, `socket`, `ibverbs`
+  - values: `dpdk`, `socket`, `ibverbs`, `gpunetio_verbs`
 - **`log_level`**: Engine log level.
   - type: `string`
   - values: `trace`, `debug`, `info`, `warn` (default), `error`, `critical`, `off`
@@ -228,12 +232,12 @@ filtering, and receive batching.
 
 When using RoCE, set `stream_type: "socket"` and use `roce://` endpoint addresses
 plus a `roce_config` block for transport settings. A RoCE URI may include
-`?engine=ibverbs`; when omitted, `ibverbs` is the default and only supported RoCE
-engine.
+`?engine=ibverbs`; when omitted, `ibverbs` is the default RoCE engine. The experimental
+`gpunetio_verbs` engine is selected with the top-level `engine` key.
 
 - **`roce_config.transport_mode`**: RDMA transport type.
   - type: `string`
-  - values: `RC` (Reliable Connected), `UC` (Unreliable Connected)
+  - values: `RC` (Reliable Connected), `UC` (Unreliable Connected; not with `gpunetio_verbs`)
 
 Each RoCE client connection uses one TX queue from the interface whose `address`
 field matches the connection's local IP address. An application can choose that
@@ -244,6 +248,44 @@ Queue positions are independent for each interface: the first connection through
 an interface uses position 0, and later connections through the same interface use
 the lowest unused position. A connection fails with `NO_SPACE_AVAILABLE` when all
 TX queues on that interface are already in use.
+
+### GPUNetIO Verbs RoCE engine
+
+`engine: "gpunetio_verbs"` on a socket stream (experimental, built with `gpunetio_verbs` in
+`DAQIRI_ENGINE`, DOCA 3.6 or newer) selects the RoCE engine of `gpunetio_verbs`, internally
+`gpunetio_rdma`, as `ibverbs` selects the `rdma` engine. It serves `roce://` endpoints with the
+same API and connection model as `ibverbs`: `rdma_cm` connects the client and server, so either
+peer can run the `ibverbs` engine, and the application posts SEND and RECEIVE bursts on a
+connection and gets them back from `get_rx_burst()` once they complete. The NIC queues are driven
+from the GPU instead: each queue slot owns a DOCA Verbs RC queue pair, created at initialization
+with its work queues and completion queues in GPU memory, and one block of a resident CUDA kernel
+posts the slot's work requests and polls its completions. One CPU thread per slot, on the queue's
+`cpu_core`, moves bursts between the application and the kernel.
+
+- **Slots:** a server interface has one slot per RX queue, a client interface one per TX queue.
+  A slot serves one connection at a time; after a disconnect the engine flushes and resets its
+  queue pair and the slot accepts a new connection. Completions the application did not collect
+  before the disconnect are dropped, with a warning.
+- **Queues:** each queue pair holds 1024 send and 1024 receive work requests, and a burst holds
+  at most 1024 messages of at most 1 GiB. Every message is one work request with its own
+  completion.
+- **GPU:** the kernel and the queue rings use the GPU of the `device` memory regions (all of them
+  must have the same `affinity`), or CUDA device 0 without any. The GPU must ring the NIC
+  doorbells directly (DOCA GPUNetIO `GPU_SM_DB`); `daqiri_init()` fails otherwise.
+- **Memory:** buffers can be in any memory region kind; `device` regions are registered through
+  dma-buf, so `nvidia-peermem` is not needed. On GPUs older than Hopper, a receive burst into
+  `device` memory completes only after a memory consistency work request, so that the GPU sees
+  the received data.
+- **Completions:** a RECEIVE completion carries the received byte counts in the burst's packet
+  lengths. A SEND or RECEIVE burst whose work request failed completes with
+  `Status::GENERIC_FAILURE`; RDMA READ and WRITE are not supported and complete with
+  `Status::NOT_SUPPORTED`.
+- **Not supported:** `transport_mode: UC`, one-sided operations, and Ethernet/IP/UDP header
+  helpers. `DAQIRI_RDMA_MIN_RNR_TIMER` works as with `ibverbs`.
+- **CUDA:** the kernel runs until `shutdown()`, so an application `cudaFree()` or
+  `cudaDeviceSynchronize()` blocks until then (`cudaMalloc()`, `cudaMemcpy()` and stream work do
+  not). Under CUDA lazy loading (the default) the first launch of a kernel also waits for it: set
+  `CUDA_MODULE_LOADING=EAGER`, or load the application kernels before `daqiri_init()`.
 
 ## Receive Configuration (rx)
 
@@ -625,6 +667,57 @@ For the raw ibverbs engine, an equivalent `TxQueueConfig` can be passed to
 `add_tx_queue_async()` after initialization. The queue must reference existing memory regions and
 fit the metadata capacity reserved at initialization. Runtime TX queues require no flow rule;
 delete completion waits for submitted work and application-held allocations to be returned.
+
+### GPUNetIO Verbs engine
+
+`engine: "gpunetio_verbs"` (experimental) runs the queues of a raw stream as DOCA Verbs Ethernet
+send and receive queues whose rings, doorbell records and completion queues live in GPU memory,
+and drives them from CUDA kernels with DOCA GPUNetIO. One resident RX kernel serves all the RX
+queues and one resident TX kernel all the TX queues, with one CUDA block per queue. One CPU thread
+per `cpu_core` moves the bursts of the queues pinned to that core between the kernels and the
+application. All the kernels run on the GPU that the queue memory regions name in their
+`affinity`.
+
+- **Receive ring:** the single memory region of an RX queue becomes its receive ring and can't be
+  shared with another queue. Its slots are `buf_size` rounded up to a multiple of 64 bytes, and
+  the ring holds a power-of-two count of them, at most 32768: DAQIRI rounds the `num_bufs` of a
+  region it allocates up (at least 64 and at least `batch_size`), and uses the first slots of a
+  caller-owned region. A received packet bigger than a slot stops the queue, so keep the port MTU
+  at most the slot size minus 18 bytes.
+- **Transmit slots:** the single memory region of a TX queue can't be shared with another queue
+  either: the queue hands out the packet slots of its whole region. `send_tx_burst()` rejects a
+  burst with a packet length of 0 or larger than the slot. The NIC computes the IPv4 and UDP
+  checksums of every packet.
+- **Ownership:** received packets stay valid until the application frees their burst with
+  `free_all_packets()` (or `free_packet()` for each packet); only then does the NIC reuse their
+  slots. Bursts can be freed in any order, but slots return to the NIC in arrival order, so a
+  burst held for long blocks the reuse of the newer ones. When the ring is full the NIC drops
+  incoming packets.
+- **Bursts:** a burst holds `batch_size` packets, except at the end of the ring and when
+  `timeout_us` elapses first. The packet pointers point into the region, and the lengths into
+  pinned host memory.
+- **Steering:** mlx5 DevX TIRs and `mlx5dv_dr` rules match the RX flows (IPv4/UDP or Ethernet
+  fields) in configuration order, and spread a flow with several queue IDs over them with a
+  Toeplitz hash of the IPv4 addresses and UDP ports. Each packet carries the ID of its flow, which
+  `get_packet_flow_id()` returns. With `flow_isolation: true`, unmatched packets go to the kernel,
+  otherwise to the first RX queue. The rules go in the NIC root table, which takes 16 per
+  interface: the RX flows, plus the rule for unmatched packets when `flow_isolation` is false.
+  Only one interface per NIC port may have RX queues.
+- **Not supported:** header-data split, memory regions other than `device` and `host_pinned`,
+  queues on more than one GPU, software and hardware loopback, TX offloads, `pacing_mbps`,
+  `accurate_send`, `hardware_timestamps`, `ipv4_len`, flex-item and eCPRI matches, dynamic and
+  runtime flows, runtime resources, reorder, and direct polling.
+- **Privileges:** creating raw Ethernet queues and steering rules needs root (`CAP_NET_RAW`).
+- **CUDA:** the resident kernels run until `shutdown()`, and the GPU must run all their blocks at
+  once: `daqiri_init()` fails if it can't fit one block per queue. `cudaDeviceSynchronize()` and
+  `cudaFree()` of a valid pointer wait for every running kernel, so they block until then:
+  synchronize streams instead, and free device memory with `cudaFreeAsync()` or after
+  `shutdown()`. With CUDA lazy loading, the default, the first launch of an application kernel
+  after `daqiri_init()` blocks the same way: set `CUDA_MODULE_LOADING=EAGER`, or load the kernels
+  before `daqiri_init()`, for example with `cudaFuncGetAttributes()`. `cudaMalloc()`,
+  `cudaMemcpy()` and work on other streams are not affected. On GPUs that don't order GPUDirect
+  RDMA writes for their own kernels (before Hopper), the RX threads flush them with
+  `cuFlushGPUDirectRDMAWrites()` before each batch of bursts in `device` memory.
 
 ### Transmit Flows
 

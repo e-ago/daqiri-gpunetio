@@ -97,7 +97,44 @@ allocation and CUDA context must remain alive until `shutdown()` completes. DAQI
 from the NIC but never frees, unpins, or unmaps it. Direct TCP/UDP sockets reject bindings because
 their configured regions are not packet pools. DPDK also rejects externally bound `huge` regions:
 EAL assumes ownership of pre-existing hugepage mappings during initialization and unmaps them at
-cleanup. External `huge` regions remain supported by ibverbs/RDMA.
+cleanup. External `huge` regions remain supported by ibverbs/RDMA. The `gpunetio_verbs` engine
+accepts `device` and `host_pinned` bindings; an RX queue receives into the first power-of-two
+count of buffers of its region, at most 32768.
+
+### GPUNetIO Verbs engine notes
+
+The experimental raw `gpunetio_verbs` engine (`engine: "gpunetio_verbs"`, built with
+`gpunetio_verbs` in `DAQIRI_ENGINE`, DOCA 3.6 or newer) runs its queues as DOCA Verbs Ethernet
+queues driven by CUDA kernels through DOCA GPUNetIO. Applications use the same burst API as the
+other raw engines, with these differences:
+
+- **Engine selection.** It is chosen only by an explicit `engine: "gpunetio_verbs"` on a raw
+  stream, never by default, and needs root to create its raw queues and steering rules. On a
+  socket stream with `roce://` endpoints, the same `engine` value selects its RoCE engine, which
+  keeps the API of the `ibverbs` RoCE engine (see the
+  [configuration reference](configuration.md#gpunetio-verbs-roce-engine)).
+- **Memory.** Each queue needs a memory region of its own, of kind `device` or `host_pinned`, and
+  all the queue regions name the same GPU in their `affinity`; validation rejects other layouts.
+  RX regions are rings of 64-byte-multiple slots, a power-of-two count of them up to 32768.
+  Packets larger than a slot stop the queue.
+- **Burst ownership.** RX buffers go back to the NIC only when the application frees the burst,
+  so free RX bursts promptly. A TX burst from `get_tx_packet_burst()` that is not sent can be
+  returned with `free_all_packets()` in any order relative to other bursts; its slots become
+  reusable once the earlier slots have completed.
+- **Flow IDs.** `get_packet_flow_id()` returns the `id` of the RX flow that steered each packet
+  (flow IDs fit in 24 bits), or `0` for unmatched packets. An interface takes 16 steering rules:
+  its RX flows, plus one for unmatched packets when `flow_isolation` is false.
+- **TX lengths.** `send_tx_burst()` returns `Status::INVALID_PARAMETER`, and leaves the burst to
+  the caller, when a packet length is 0 or larger than its slot.
+- **GPU lifetime.** The RX and TX kernels run until `shutdown()`, so `cudaFree()` and
+  `cudaDeviceSynchronize()` in the application block until then (`cudaMalloc()`, `cudaMemcpy()`
+  and stream work do not). Set `CUDA_MODULE_LOADING=EAGER`, or load the application's own kernels
+  with `cudaFuncGetAttributes()` before `daqiri_init()`: with lazy loading, the first launch of a
+  kernel after initialization waits for the resident kernels to exit. The GPU must be able to run
+  one resident block per queue at once, or `daqiri_init()` fails.
+- **Not supported.** Software and hardware loopback, TX offloads (the NIC always computes the IPv4
+  and UDP checksums), pacing, `accurate_send`, hardware timestamps, dynamic and runtime flows,
+  runtime resources, flex items, reorder, and flow matches other than IPv4/UDP or Ethernet.
 
 If GPU RX `reorder_configs` are configured for Raw Ethernet (`stream_type: "raw"`), set
 one CUDA stream per GPU reorder plan before pulling reordered bursts. CPU reorder configs do not use a

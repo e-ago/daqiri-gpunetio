@@ -392,6 +392,20 @@ canonical config can run both endpoints in one process:
   --seconds 10 --mode both
 ```
 
+To run the same benchmark on the experimental `gpunetio_verbs` engine, where a CUDA kernel posts
+the RDMA work requests, build with `gpunetio_verbs` in `DAQIRI_ENGINE` and start from
+`examples/daqiri_bench_rdma_tx_rx_gpunetio_verbs.yaml`:
+
+```bash
+CUDA_MODULE_LOADING=EAGER ./build-socket-rdma/examples/daqiri_bench_rdma \
+  examples/daqiri_bench_rdma_tx_rx_gpunetio_verbs.yaml \
+  --seconds 10 --mode both
+```
+
+Both engines connect through `rdma_cm`, so a split test can run one role on each engine. See the
+[GPUNetIO Verbs RoCE engine](../api-reference/configuration.md#gpunetio-verbs-roce-engine)
+reference for its limits.
+
 `rdma_bench_server` and `rdma_bench_client` accept `cpu_core` plus optional
 `tx_depth` and `rx_depth` fields. `cpu_core` pins the benchmark application's
 server/client role thread, separately from the DAQIRI queue worker cores. The

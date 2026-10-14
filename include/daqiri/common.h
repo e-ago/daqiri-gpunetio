@@ -1450,10 +1450,11 @@ template <> struct YAML::convert<daqiri::NetworkConfig> {
         return false;
       }
 
-      // An explicit engine: ibverbs implies RoCE; otherwise the protocol is
-      // derived from the endpoint URI scheme during interface parsing.
+      // An explicit engine: ibverbs or gpunetio_verbs implies RoCE; otherwise the
+      // protocol is derived from the endpoint URI scheme during interface parsing.
       input_spec.common_.protocol =
-          (socket_used && input_spec.common_.engine == daqiri::EngineType::RDMA)
+          (socket_used && (input_spec.common_.engine == daqiri::EngineType::RDMA ||
+                           input_spec.common_.engine == daqiri::EngineType::GPUNETIO_RDMA))
               ? daqiri::SocketProtocol::ROCE
               : daqiri::SocketProtocol::INVALID;
 

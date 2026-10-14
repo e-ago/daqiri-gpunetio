@@ -523,7 +523,9 @@ void bind_enums(py::module_ &m) {
       .value("DEFAULT", EngineType::DEFAULT)
       .value("DPDK", EngineType::DPDK)
       .value("SOCKET", EngineType::SOCKET)
-      .value("RDMA", EngineType::RDMA);
+      .value("RDMA", EngineType::RDMA)
+      .value("GPUNETIO_VERBS", EngineType::GPUNETIO_VERBS)
+      .value("GPUNETIO_RDMA", EngineType::GPUNETIO_RDMA);
 
   py::enum_<Direction>(m, "Direction")
       .value("RX", Direction::RX)

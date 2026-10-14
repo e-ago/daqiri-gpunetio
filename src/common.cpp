@@ -1025,7 +1025,13 @@ Status get_memory_region_requirements(const NetworkConfig& config,
         req.slot_size = ceil_power_of_two(mr.buf_size_);
         break;
       case EngineType::RDMA:
+      case EngineType::GPUNETIO_RDMA:
         req.slot_size = ceil_to(mr.buf_size_, gpu_page_size);
+        break;
+      case EngineType::GPUNETIO_VERBS:
+        // Slots of a 64-byte multiple. An RX queue receives into the first power-of-two count of
+        // them, at most 32768.
+        req.slot_size = ceil_to(std::max<size_t>(mr.buf_size_, 64), 64);
         break;
       default:
         DAQIRI_LOG_ERROR("Cannot compute memory requirements for engine {}",

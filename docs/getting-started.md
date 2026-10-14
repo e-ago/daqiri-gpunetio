@@ -53,6 +53,7 @@ builds, install the matching packages yourself by following the
 | **AWS SDK for C++ with S3** | Raw packet writes to S3-compatible object stores | Only needed with `-DDAQIRI_ENABLE_S3=ON`; the container can build this SDK from source. |
 | **OpenTelemetry C++** | Metrics instrumentation | Only needed with `-DDAQIRI_ENABLE_OTEL_METRICS=ON`; applications still configure the SDK reader/exporter. |
 | **libnuma** | NUMA-aware ring, pool, and huge-memory placement | Auto-detected. DAQIRI falls back to first-touch placement when absent. |
+| **DOCA 3.6+ GPUNetIO, Verbs and Common SDKs** | Experimental `gpunetio_verbs` raw Ethernet and RoCE engines | Only needed with `gpunetio_verbs` in `DAQIRI_ENGINE` (`libdoca-sdk-gpunetio-dev`, `libdoca-sdk-verbs-dev`, `libdoca-sdk-common-dev`), together with libibverbs, librdmacm and the mlx5 provider. |
 
 ## Build {#build-the-daqiri-library}
 
