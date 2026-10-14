@@ -7,7 +7,7 @@ target_include_directories(daqiri_init_validation_test PRIVATE ${PROJECT_SOURCE_
 
 if(NOT BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
   set(DAQIRI_TEST_STATIC_LIBS daqiri::daqiri)
-  foreach(engine IN ITEMS dpdk socket rdma ibverbs)
+  foreach(engine IN ITEMS dpdk socket rdma ibverbs gpunetio_rdma gpunetio_verbs)
     if(TARGET daqiri_${engine})
       list(APPEND DAQIRI_TEST_STATIC_LIBS daqiri_${engine})
     endif()
@@ -161,4 +161,42 @@ if(DAQIRI_IBVERBS_DLOPEN AND TARGET daqiri_raw_verbs_glue AND NOT BUILD_SHARED_L
       -DDAQIRI_PKG_CONFIG=${DAQIRI_TEST_PKG_CONFIG}
       -DDAQIRI_READELF=${DAQIRI_TEST_READELF}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/check_rdma_static_install.cmake)
+endif()
+
+if(TARGET daqiri_gpunetio_verbs)
+  add_executable(daqiri_gpunetio_verbs_config_validation_test gpunetio_verbs_config_validation_test.cpp)
+  target_compile_features(daqiri_gpunetio_verbs_config_validation_test PRIVATE cxx_std_17)
+  target_include_directories(daqiri_gpunetio_verbs_config_validation_test PRIVATE ${PROJECT_SOURCE_DIR})
+  if(NOT BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
+    target_link_libraries(daqiri_gpunetio_verbs_config_validation_test PRIVATE
+      "-Wl,--start-group"
+      ${DAQIRI_TEST_STATIC_LIBS}
+      "-Wl,--end-group"
+      ${DAQIRI_YAML_TARGET})
+  else()
+    target_link_libraries(daqiri_gpunetio_verbs_config_validation_test PRIVATE daqiri::daqiri
+                          ${DAQIRI_YAML_TARGET})
+  endif()
+
+  add_test(NAME daqiri_gpunetio_verbs_config_validation_test
+           COMMAND daqiri_gpunetio_verbs_config_validation_test)
+endif()
+
+if(TARGET daqiri_gpunetio_rdma)
+  add_executable(daqiri_gpunetio_rdma_config_validation_test gpunetio_rdma_config_validation_test.cpp)
+  target_compile_features(daqiri_gpunetio_rdma_config_validation_test PRIVATE cxx_std_17)
+  target_include_directories(daqiri_gpunetio_rdma_config_validation_test PRIVATE ${PROJECT_SOURCE_DIR})
+  if(NOT BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
+    target_link_libraries(daqiri_gpunetio_rdma_config_validation_test PRIVATE
+      "-Wl,--start-group"
+      ${DAQIRI_TEST_STATIC_LIBS}
+      "-Wl,--end-group"
+      ${DAQIRI_YAML_TARGET})
+  else()
+    target_link_libraries(daqiri_gpunetio_rdma_config_validation_test PRIVATE daqiri::daqiri
+                          ${DAQIRI_YAML_TARGET})
+  endif()
+
+  add_test(NAME daqiri_gpunetio_rdma_config_validation_test
+           COMMAND daqiri_gpunetio_rdma_config_validation_test)
 endif()

@@ -29,6 +29,12 @@
 #if DAQIRI_ENGINE_IBVERBS
 #include "src/engines/ibverbs/daqiri_ibverbs_engine.h"
 #endif
+#if DAQIRI_ENGINE_GPUNETIO_VERBS
+#include "src/engines/gpunetio_verbs/daqiri_gpunetio_verbs_engine.h"
+#endif
+#if DAQIRI_ENGINE_GPUNETIO_RDMA
+#include "src/engines/gpunetio_rdma/daqiri_gpunetio_rdma_engine.h"
+#endif
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -411,6 +417,16 @@ std::unique_ptr<Engine> EngineFactory::create_instance(EngineType type) {
 #if DAQIRI_ENGINE_IBVERBS
     case EngineType::IBVERBS:
       _engine = std::make_unique<IbverbsEngine>();
+      break;
+#endif
+#if DAQIRI_ENGINE_GPUNETIO_VERBS
+    case EngineType::GPUNETIO_VERBS:
+      _engine = std::make_unique<GpunetioVerbsEngine>();
+      break;
+#endif
+#if DAQIRI_ENGINE_GPUNETIO_RDMA
+    case EngineType::GPUNETIO_RDMA:
+      _engine = std::make_unique<GpunetioRdmaEngine>();
       break;
 #endif
     case EngineType::DEFAULT:
@@ -1169,6 +1185,241 @@ int Engine::get_port_id(const std::string& key) {
   return -1;
 }
 
+// Limits of the gpunetio_verbs engine. They are checked here, in the shared hardware-independent
+// validation, so that daqiri_config_validate reports them without a GPU or NIC.
+static bool validate_gpunetio_verbs_network_config(const NetworkConfig& config) {
+  bool pass = true;
+  if (config.common_.stream_type != StreamType::RAW) {
+    DAQIRI_LOG_ERROR("The gpunetio_verbs engine needs stream_type 'raw'");
+    pass = false;
+  }
+  // Hardware loopback is rejected by the shared checks for every engine but ibverbs
+  if (config.common_.loopback_ == LoopbackType::LOOPBACK_TYPE_SW) {
+    DAQIRI_LOG_ERROR("The gpunetio_verbs engine does not support software loopback");
+    pass = false;
+  }
+
+  std::unordered_map<std::string, int> mr_queues;
+  for (const auto& intf : config.ifs_) {
+    for (const auto& rxq : intf.rx_.queues_) {
+      for (const auto& mr_name : rxq.common_.mrs_) {
+        mr_queues[mr_name]++;
+      }
+    }
+    for (const auto& txq : intf.tx_.queues_) {
+      for (const auto& mr_name : txq.common_.mrs_) {
+        mr_queues[mr_name]++;
+      }
+    }
+  }
+
+  // The kernels and the queue rings run on the GPU the queue memory regions name in their
+  // affinity
+  std::set<uint16_t> gpus;
+  const auto check_queue = [&](const CommonQueueConfig& queue, const char* direction) {
+    if (queue.mrs_.size() != 1) {
+      DAQIRI_LOG_ERROR(
+          "{} queue '{}' lists {} memory regions; gpunetio_verbs queues need exactly one",
+          direction, queue.name_, queue.mrs_.size());
+      pass = false;
+    }
+    for (const auto& mr_name : queue.mrs_) {
+      // The region of an RX queue is its receive ring, and a TX queue hands out the slots of its
+      // whole region
+      if (mr_queues[mr_name] > 1) {
+        DAQIRI_LOG_ERROR(
+            "{} queue '{}' shares memory region '{}' with another queue; a gpunetio_verbs queue "
+            "needs a region of its own",
+            direction, queue.name_, mr_name);
+        pass = false;
+      }
+      const auto mr = config.mrs_.find(mr_name);
+      if (mr == config.mrs_.end()) {
+        continue;
+      }
+      if (mr->second.kind_ != MemoryKind::DEVICE && mr->second.kind_ != MemoryKind::HOST_PINNED) {
+        DAQIRI_LOG_ERROR(
+            "{} queue '{}' uses memory region '{}'; gpunetio_verbs needs kind 'device' or "
+            "'host_pinned'",
+            direction, queue.name_, mr_name);
+        pass = false;
+      }
+      gpus.insert(mr->second.affinity_);
+    }
+  };
+
+  for (const auto& intf : config.ifs_) {
+    for (const auto& rxq : intf.rx_.queues_) {
+      check_queue(rxq.common_, "RX");
+      for (const auto& mr_name : rxq.common_.mrs_) {
+        const auto mr = config.mrs_.find(mr_name);
+        if (mr != config.mrs_.end() &&
+            mr->second.num_bufs_ < static_cast<size_t>(std::max(0, rxq.common_.batch_size_))) {
+          DAQIRI_LOG_ERROR(
+              "RX queue '{}' has batch_size {} but memory region '{}' holds only {} buffers",
+              rxq.common_.name_, rxq.common_.batch_size_, mr_name, mr->second.num_bufs_);
+          pass = false;
+        }
+      }
+      // The receive ring holds at most 32768 packets
+      if (rxq.common_.batch_size_ > 32768) {
+        DAQIRI_LOG_ERROR("RX queue '{}' has batch_size {}; gpunetio_verbs supports up to 32768",
+                         rxq.common_.name_, rxq.common_.batch_size_);
+        pass = false;
+      }
+    }
+    for (const auto& txq : intf.tx_.queues_) {
+      check_queue(txq.common_, "TX");
+      for (const auto& mr_name : txq.common_.mrs_) {
+        const auto mr = config.mrs_.find(mr_name);
+        if (mr != config.mrs_.end() &&
+            mr->second.num_bufs_ < static_cast<size_t>(std::max(0, txq.common_.batch_size_))) {
+          DAQIRI_LOG_ERROR(
+              "TX queue '{}' has batch_size {} but memory region '{}' holds only {} buffers",
+              txq.common_.name_, txq.common_.batch_size_, mr_name, mr->second.num_bufs_);
+          pass = false;
+        }
+      }
+      if (!txq.common_.offloads_.empty()) {
+        DAQIRI_LOG_ERROR(
+            "TX queue '{}' requests offloads; gpunetio_verbs supports none (the NIC always "
+            "computes the IPv4 and UDP checksums)",
+            txq.common_.name_);
+        pass = false;
+      }
+      if (txq.pacing_mbps_ != 0) {
+        DAQIRI_LOG_ERROR("TX queue '{}' sets pacing_mbps; gpunetio_verbs has no packet pacing",
+                         txq.common_.name_);
+        pass = false;
+      }
+    }
+    if (intf.tx_.accurate_send_) {
+      DAQIRI_LOG_ERROR("Interface '{}' enables accurate_send; gpunetio_verbs does not support it",
+                       intf.name_);
+      pass = false;
+    }
+    if (intf.rx_.hardware_timestamps_) {
+      DAQIRI_LOG_ERROR(
+          "Interface '{}' enables hardware_timestamps; gpunetio_verbs does not support them",
+          intf.name_);
+      pass = false;
+    }
+    if (intf.rx_.dynamic_flow_capacity_ != 0) {
+      DAQIRI_LOG_ERROR(
+          "Interface '{}' sets dynamic_flow_capacity; gpunetio_verbs has no runtime flows",
+          intf.name_);
+      pass = false;
+    }
+    if (!intf.rx_.flex_items_.empty()) {
+      DAQIRI_LOG_ERROR("Interface '{}' defines flex items; gpunetio_verbs does not support them",
+                       intf.name_);
+      pass = false;
+    }
+    if (!intf.rx_.reorder_configs_.empty()) {
+      DAQIRI_LOG_ERROR("Interface '{}' defines reorder configs; gpunetio_verbs has no reorder",
+                       intf.name_);
+      pass = false;
+    }
+    // The steering rules go in the NIC root table, which has 16 priorities: one per RX flow, in
+    // configuration order, plus one for the rule sending unmatched packets to the first RX queue
+    const size_t steering_rules =
+        intf.rx_.flows_.size() + (intf.rx_.flow_isolation_ || intf.rx_.queues_.empty() ? 0 : 1);
+    if (steering_rules > 16) {
+      DAQIRI_LOG_ERROR(
+          "Interface '{}' needs {} steering rules; gpunetio_verbs supports 16 per interface (the "
+          "RX flows, plus one for unmatched packets when flow_isolation is false)",
+          intf.name_, steering_rules);
+      pass = false;
+    }
+    for (const auto& flow : intf.rx_.flows_) {
+      if (flow.match_.type_ != FlowMatchType::IPV4_UDP &&
+          flow.match_.type_ != FlowMatchType::ETHERNET) {
+        DAQIRI_LOG_ERROR(
+            "RX flow '{}' on interface '{}' needs an IPv4/UDP or Ethernet match with "
+            "gpunetio_verbs",
+            flow.name_, intf.name_);
+        pass = false;
+      }
+      const FlowMatch& match = flow.match_;
+      if (match.ipv4_len_ != 0) {
+        DAQIRI_LOG_ERROR(
+            "RX flow '{}' on interface '{}' matches ipv4_len, which gpunetio_verbs does not "
+            "support",
+            flow.name_, intf.name_);
+        pass = false;
+      } else if (match.type_ == FlowMatchType::IPV4_UDP && match.udp_src_ == 0 &&
+                 match.udp_dst_ == 0 && match.ipv4_src_ == INADDR_ANY &&
+                 match.ipv4_dst_ == INADDR_ANY && !match.ethernet_match_.match_src_ &&
+                 !match.ethernet_match_.match_dst_) {
+        DAQIRI_LOG_ERROR("RX flow '{}' on interface '{}' matches no field", flow.name_, intf.name_);
+        pass = false;
+      }
+      // The NIC tags each packet with the ID of its flow in 24 bits
+      if (flow.id_ > 0x00ffffffU) {
+        DAQIRI_LOG_ERROR("RX flow '{}' has ID {}; gpunetio_verbs flow IDs are at most {}",
+                         flow.name_, flow.id_, 0x00ffffffU);
+        pass = false;
+      }
+    }
+  }
+
+  if (gpus.size() > 1) {
+    DAQIRI_LOG_ERROR(
+        "The gpunetio_verbs engine runs on one GPU: the memory regions of its queues need the same "
+        "affinity");
+    pass = false;
+  }
+  return pass;
+}
+
+// Limits of the gpunetio_rdma engine, the RoCE half of gpunetio_verbs. They are checked here, in
+// the shared hardware-independent validation, so that daqiri_config_validate reports them without a
+// GPU or NIC.
+static bool validate_gpunetio_rdma_network_config(const NetworkConfig& config) {
+  bool pass = true;
+  if (config.common_.stream_type != StreamType::SOCKET ||
+      config.common_.protocol != SocketProtocol::ROCE) {
+    DAQIRI_LOG_ERROR(
+        "The gpunetio_verbs RoCE engine needs stream_type 'socket' with roce:// endpoints");
+    pass = false;
+  }
+
+  // The kernel and the queue rings of every connection run on one GPU
+  std::set<uint16_t> gpus;
+  for (const auto& [name, mr] : config.mrs_) {
+    (void)name;
+    if (mr.kind_ == MemoryKind::DEVICE) {
+      gpus.insert(mr.affinity_);
+    }
+  }
+  if (gpus.size() > 1) {
+    DAQIRI_LOG_ERROR(
+        "The gpunetio_verbs RoCE engine runs on one GPU: every 'device' memory region needs the "
+        "same affinity");
+    pass = false;
+  }
+
+  for (const auto& intf : config.ifs_) {
+    if (intf.rdma_.xmode_ != RDMATransportMode::RC) {
+      DAQIRI_LOG_ERROR(
+          "Interface '{}': the gpunetio_verbs RoCE engine supports roce_config.transport_mode RC "
+          "only",
+          intf.name_);
+      pass = false;
+    }
+    // Server interfaces get one connection slot per RX queue, clients one per TX queue
+    if (intf.rdma_.mode_ == RDMAMode::SERVER && intf.rx_.queues_.empty()) {
+      DAQIRI_LOG_ERROR("Server interface '{}' needs RX queues, one per connection", intf.name_);
+      pass = false;
+    }
+    if (intf.rdma_.mode_ == RDMAMode::CLIENT && intf.tx_.queues_.empty()) {
+      DAQIRI_LOG_ERROR("Client interface '{}' needs TX queues, one per connection", intf.name_);
+      pass = false;
+    }
+  }
+  return pass;
+}
+
 bool validate_network_config(const NetworkConfig& config) {
   bool pass = true;
   std::set<std::string> mr_names;
@@ -1447,6 +1698,15 @@ bool validate_network_config(const NetworkConfig& config) {
           "Queue found using MR {}, but that MR doesn't exist in the memory_region config", mr);
       pass = false;
     }
+  }
+
+  if (config.common_.engine_type == EngineType::GPUNETIO_VERBS &&
+      !validate_gpunetio_verbs_network_config(config)) {
+    pass = false;
+  }
+  if (config.common_.engine_type == EngineType::GPUNETIO_RDMA &&
+      !validate_gpunetio_rdma_network_config(config)) {
+    pass = false;
   }
 
   return pass;

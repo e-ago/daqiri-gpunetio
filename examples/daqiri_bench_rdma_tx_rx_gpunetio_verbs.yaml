@@ -1,0 +1,100 @@
+%YAML 1.2
+---
+# RoCE client and server on the experimental gpunetio_verbs engine (DOCA Verbs + DOCA GPUNetIO).
+# On a socket stream, engine: gpunetio_verbs selects its RoCE engine (gpunetio_rdma), as ibverbs
+# selects the rdma engine: CUDA kernels post the RDMA SEND/RECV work requests and poll their
+# completions. Same bench and connection model as daqiri_bench_rdma_tx_rx.yaml. Build with
+# gpunetio_verbs in DAQIRI_ENGINE and replace the addresses with the IPv4 addresses of your RoCE
+# ports.
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "socket"
+    engine: "gpunetio_verbs"
+    master_core: 3
+    debug: false
+    log_level: "info"
+
+    # The queue rings and the kernel live on the GPU of the device memory regions
+    memory_regions:
+    - name: "DATA_RX_GPU_SERVER"
+      kind: "device"
+      affinity: 0
+      num_bufs: 32
+      buf_size: 8388608
+    - name: "DATA_TX_GPU_SERVER"
+      kind: "device"
+      affinity: 0
+      num_bufs: 32
+      buf_size: 8388608
+    - name: "DATA_TX_GPU_CLIENT"
+      kind: "device"
+      affinity: 0
+      num_bufs: 32
+      buf_size: 8388608
+    - name: "DATA_RX_GPU_CLIENT"
+      kind: "device"
+      affinity: 0
+      num_bufs: 32
+      buf_size: 8388608
+
+    # A client interface has one connection slot per TX queue, a server one per RX queue. Each
+    # slot has a queue pair, a block of the GPU kernel and a CPU thread on the queue's cpu_core.
+    interfaces:
+    - name: my_client
+      address: 10.100.1.1
+      socket_config:
+        mode: client
+        local_addr: "roce://10.100.1.1"
+      roce_config:
+        transport_mode: RC
+      tx:
+        queues:
+        - name: "Client_TX_Queue"
+          id: 0
+          batch_size: 1
+          cpu_core: 7
+      rx:
+        queues:
+        - name: "Client_RX_Queue"
+          id: 0
+          cpu_core: 7
+          batch_size: 1
+    - name: my_server
+      address: 10.100.3.1
+      socket_config:
+        mode: server
+        local_addr: "roce://10.100.3.1:4096"
+      roce_config:
+        transport_mode: RC
+      rx:
+        queues:
+        - name: "Server_RX_Queue"
+          id: 0
+          cpu_core: 8
+          batch_size: 1
+      tx:
+        queues:
+        - name: "Server_TX_Queue"
+          id: 0
+          cpu_core: 8
+          batch_size: 1
+
+rdma_bench_server:
+  server_address: 10.100.3.1
+  server_port: 4096
+  message_size: 8000000
+  send: true
+  receive: true
+  cpu_core: 9
+  server: true
+
+rdma_bench_client:
+  message_size: 8000000
+  client_address: 10.100.1.1
+  server_address: 10.100.3.1
+  server_port: 4096
+  receive: true
+  send: true
+  cpu_core: 10
+  server: false

@@ -51,6 +51,7 @@ set(DAQIRI_BENCH_CONFIGS
   daqiri_bench_raw_sw_loopback.yaml
   daqiri_bench_raw_hw_loopback_ibverbs.yaml
   daqiri_bench_raw_latency_ibverbs.yaml
+  daqiri_bench_raw_tx_rx_gpunetio_verbs.yaml
   daqiri_example_named_endpoints_tx_rx.yaml
   daqiri_example_dynamic_rx_flow.yaml
   daqiri_example_gds_write_sw_loopback.yaml
@@ -58,6 +59,7 @@ set(DAQIRI_BENCH_CONFIGS
   daqiri_example_pcap_writer_sw_loopback.yaml
   daqiri_example_pcap_writer_tx_rx.yaml
   daqiri_bench_rdma_tx_rx.yaml
+  daqiri_bench_rdma_tx_rx_gpunetio_verbs.yaml
   daqiri_bench_socket_udp_tx_rx.yaml
   daqiri_bench_socket_tcp_tx_rx.yaml
 )
@@ -70,7 +72,7 @@ function(link_daqiri_bench target)
   target_compile_features(${target} PRIVATE cxx_std_17)
   if(NOT BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
     set(DAQIRI_EXAMPLE_STATIC_LIBS daqiri::daqiri)
-    foreach(engine IN ITEMS dpdk socket rdma ibverbs)
+    foreach(engine IN ITEMS dpdk socket rdma ibverbs gpunetio_rdma gpunetio_verbs)
       if(TARGET daqiri_${engine})
         list(APPEND DAQIRI_EXAMPLE_STATIC_LIBS daqiri_${engine})
       endif()

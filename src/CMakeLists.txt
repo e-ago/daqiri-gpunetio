@@ -92,9 +92,9 @@ endif()
 # entirely in src/engines/dpdk and src/engine_dpdk.cpp. daqiri_common and the
 # rdma/ibverbs/socket engines use the libdpdk-free daqiri::Ring / ObjectPool.
 if(NOT DEFINED DAQIRI_ENGINE)
-    set(DAQIRI_ENGINE "dpdk ibverbs" CACHE STRING "Optional engine implementations to build: dpdk, ibverbs (Linux sockets are always built in)")
+    set(DAQIRI_ENGINE "dpdk ibverbs" CACHE STRING "Optional engine implementations to build: dpdk, ibverbs, gpunetio_verbs (Linux sockets are always built in)")
 endif()
-set_property(CACHE DAQIRI_ENGINE PROPERTY STRINGS "dpdk" "ibverbs")
+set_property(CACHE DAQIRI_ENGINE PROPERTY STRINGS "dpdk" "ibverbs" "gpunetio_verbs")
 separate_arguments(DAQIRI_ENGINE_LIST UNIX_COMMAND ${DAQIRI_ENGINE})
 list(FIND DAQIRI_ENGINE_LIST "dpdk" _daqiri_dpdk_idx)
 if(_daqiri_dpdk_idx EQUAL -1)
@@ -278,6 +278,8 @@ endif()
 # and is NOT a DAQIRI_ENGINE value. Valid values:
 #   dpdk    - raw Ethernet via kernel bypass
 #   ibverbs - RDMA/RoCE via libibverbs (also enables the socket RoCE path)
+#   gpunetio_verbs - NIC queues driven by CUDA kernels via DOCA Verbs and DOCA GPUNetIO
+#                    (DOCA 3.6+), for raw Ethernet and RoCE
 # DAQIRI_ENGINE / DAQIRI_ENGINE_LIST / DAQIRI_BUILD_DPDK were already parsed above
 # (before the libdpdk lookup), so they are reused here.
 
@@ -295,9 +297,16 @@ foreach(ENGINE IN LISTS DAQIRI_ENGINE_LIST)
     # engine: ibverbs).
     list(APPEND DAQIRI_ENGINE_INTERNAL_LIST "rdma")
     list(APPEND DAQIRI_ENGINE_INTERNAL_LIST "ibverbs")
+  elseif(ENGINE STREQUAL "gpunetio_verbs")
+    # As with "ibverbs", "gpunetio_verbs" builds two internal engines on DOCA Verbs and DOCA
+    # GPUNetIO: "gpunetio_rdma" (RoCE, used by socket roce:// endpoints with engine:
+    # gpunetio_verbs) and "gpunetio_verbs" (raw Ethernet, stream_type: raw + engine:
+    # gpunetio_verbs).
+    list(APPEND DAQIRI_ENGINE_INTERNAL_LIST "gpunetio_rdma")
+    list(APPEND DAQIRI_ENGINE_INTERNAL_LIST "gpunetio_verbs")
   else()
     message(FATAL_ERROR
-      "Invalid DAQIRI_ENGINE value '${ENGINE}'. Valid values: dpdk, ibverbs. "
+      "Invalid DAQIRI_ENGINE value '${ENGINE}'. Valid values: dpdk, ibverbs, gpunetio_verbs. "
       "Linux sockets are always built in (there is no 'socket' value); "
       "use 'ibverbs' for RDMA/RoCE.")
   endif()

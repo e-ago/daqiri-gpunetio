@@ -40,18 +40,20 @@ the `stream_type` and the endpoint URI scheme:
 |---|---|---|
 | `stream_type: "raw"` | **`ibverbs`** | MPRQ raw Ethernet via libibverbs/DevX (Mellanox/mlx5) |
 | `stream_type: "raw"` with `engine: "dpdk"` | **`dpdk`** (opt-in) | DPDK kernel-bypass raw Ethernet |
+| `stream_type: "raw"` with `engine: "gpunetio_verbs"` | **`gpunetio_verbs`** (opt-in, experimental) | DOCA Verbs and GPUNetIO raw Ethernet: CUDA kernels drive the NIC queues |
 | `stream_type: "socket"` with `udp://`/`tcp://` endpoints | **built-in Linux sockets** | always available, nothing to build |
 | `stream_type: "socket"` with `roce://` endpoints | **`ibverbs`** | RDMA/RoCE via libibverbs |
+| `stream_type: "socket"` with `roce://` endpoints and `engine: "gpunetio_verbs"` | **`gpunetio_verbs`** (opt-in, experimental) | DOCA Verbs and GPUNetIO RoCE: CUDA kernels drive the queue pairs |
 
 The engine concept exists so the implementation can be swapped without
 changing the stream type. For example, raw Ethernet is served by the
 `ibverbs` Multi-Packet/striding Receive Queue engine by default but can instead
 use the `dpdk` engine by setting `engine: "dpdk"` on the stream. RoCE is served by the `ibverbs` engine,
-and a future release could add a DOCA RDMA engine as an alternative for the
-same `roce://` stream.
+and the experimental `gpunetio_verbs` engine is an alternative for the same `roce://` stream, with
+the same API and connection model. Like `ibverbs`, `gpunetio_verbs` serves both stream types.
 
 At build time, `DAQIRI_ENGINE` selects which optional engines are
-compiled in (`dpdk`, `ibverbs`); Linux sockets are always available. See
+compiled in (`dpdk`, `ibverbs`, `gpunetio_verbs`); Linux sockets are always available. See
 [Getting Started](getting-started.md) for the build options.
 
 With `DAQIRI_IBVERBS_DLOPEN=ON` (default `OFF`), raw ibverbs and RoCE load

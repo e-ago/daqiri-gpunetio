@@ -360,13 +360,19 @@ enum class EngineType {
   DPDK,
   SOCKET,
   RDMA,
-  IBVERBS,  // pure-DevX MPRQ raw-Ethernet engine (stream_type: raw, engine: ibverbs)
+  IBVERBS,         // pure-DevX MPRQ raw-Ethernet engine (stream_type: raw, engine: ibverbs)
+  GPUNETIO_VERBS,  // DOCA Verbs + GPUNetIO raw-Ethernet engine (stream_type: raw, engine:
+                   // gpunetio_verbs)
+  GPUNETIO_RDMA,   // DOCA Verbs + GPUNetIO RoCE engine (stream_type: socket, engine:
+                   // gpunetio_verbs)
 };
 
 static constexpr const char* DAQIRI_ENGINE_STR__DPDK = "dpdk";
 static constexpr const char* DAQIRI_ENGINE_STR__SOCKET = "socket";
 static constexpr const char* DAQIRI_ENGINE_STR__RDMA = "rdma";
 static constexpr const char* DAQIRI_ENGINE_STR__IBVERBS = "ibverbs";
+static constexpr const char* DAQIRI_ENGINE_STR__GPUNETIO_VERBS = "gpunetio_verbs";
+static constexpr const char* DAQIRI_ENGINE_STR__GPUNETIO_RDMA = "gpunetio_rdma";
 static constexpr const char* DAQIRI_ENGINE_STR__DEFAULT = "default";
 /**
  * @brief Convert string to engine type
@@ -403,6 +409,18 @@ inline EngineType engine_type_from_string(const std::string& str) {
   available_engines += std::string(DAQIRI_ENGINE_STR__IBVERBS) + " ";
 #else
   if (str == DAQIRI_ENGINE_STR__IBVERBS || str == DAQIRI_ENGINE_STR__RDMA) {
+    is_known_but_unavailable = true;
+  }
+#endif
+
+#if DAQIRI_ENGINE_GPUNETIO_RDMA
+  // Accept both the user-facing "gpunetio_verbs" and the internal "gpunetio_rdma" name.
+  if (str == DAQIRI_ENGINE_STR__GPUNETIO_VERBS || str == DAQIRI_ENGINE_STR__GPUNETIO_RDMA) {
+    return EngineType::GPUNETIO_RDMA;
+  }
+  available_engines += std::string(DAQIRI_ENGINE_STR__GPUNETIO_VERBS) + " ";
+#else
+  if (str == DAQIRI_ENGINE_STR__GPUNETIO_VERBS || str == DAQIRI_ENGINE_STR__GPUNETIO_RDMA) {
     is_known_but_unavailable = true;
   }
 #endif
@@ -481,6 +499,10 @@ inline std::string engine_type_to_string(EngineType type) {
       return DAQIRI_ENGINE_STR__RDMA;
     case EngineType::IBVERBS:
       return DAQIRI_ENGINE_STR__IBVERBS;
+    case EngineType::GPUNETIO_VERBS:
+      return DAQIRI_ENGINE_STR__GPUNETIO_VERBS;
+    case EngineType::GPUNETIO_RDMA:
+      return DAQIRI_ENGINE_STR__GPUNETIO_RDMA;
     case EngineType::DEFAULT:
       return DAQIRI_ENGINE_STR__DEFAULT;
   }
@@ -488,8 +510,9 @@ inline std::string engine_type_to_string(EngineType type) {
 }
 
 // Parse the optional `engine:` config override. Accepts the user-facing
-// engine names; "rdma" is rejected in favor of "ibverbs". Sockets (UDP/TCP)
-// are always built in, so the socket engine is always available.
+// engine names; "rdma" is rejected in favor of "ibverbs", and "gpunetio_rdma" in
+// favor of "gpunetio_verbs". Sockets (UDP/TCP) are always built in, so the socket
+// engine is always available.
 inline EngineType config_engine_from_string(const std::string& str) {
   if (str == DAQIRI_ENGINE_STR__DEFAULT) return EngineType::DEFAULT;
 
@@ -511,31 +534,49 @@ inline EngineType config_engine_from_string(const std::string& str) {
   if (str == DAQIRI_ENGINE_STR__IBVERBS) is_known_but_unavailable = true;
 #endif
 
+#if DAQIRI_ENGINE_GPUNETIO_RDMA
+  if (str == DAQIRI_ENGINE_STR__GPUNETIO_VERBS) return EngineType::GPUNETIO_RDMA;
+#else
+  if (str == DAQIRI_ENGINE_STR__GPUNETIO_VERBS) is_known_but_unavailable = true;
+#endif
+
   if (str == DAQIRI_ENGINE_STR__RDMA) {
     throw std::invalid_argument(
         "Engine 'rdma' is not valid in config. Use 'ibverbs' for RoCE.");
   }
-
-  if (is_known_but_unavailable) {
+  if (str == DAQIRI_ENGINE_STR__GPUNETIO_RDMA) {
     throw std::invalid_argument(
-        "Engine '" + str + "' is not available in this build. Rebuild with "
-        "-DDAQIRI_ENGINE including '" + str + "' (valid values: dpdk, ibverbs).");
+        "Engine 'gpunetio_rdma' is not valid in config. Use 'gpunetio_verbs' for GPU-driven RoCE.");
   }
 
-  throw std::invalid_argument(
-      "Unknown engine '" + str + "'. Valid options: dpdk, socket, ibverbs, " +
-      DAQIRI_ENGINE_STR__DEFAULT);
+  if (is_known_but_unavailable) {
+    throw std::invalid_argument("Engine '" + str +
+                                "' is not available in this build. Rebuild with "
+                                "-DDAQIRI_ENGINE including '" +
+                                str + "' (valid values: dpdk, ibverbs, gpunetio_verbs).");
+  }
+
+  throw std::invalid_argument("Unknown engine '" + str +
+                              "'. Valid options: dpdk, socket, ibverbs, gpunetio_verbs, " +
+                              DAQIRI_ENGINE_STR__DEFAULT);
 }
 
 // Stream-aware engine resolution. The user-facing name "ibverbs" maps to two
 // different engines depending on the stream type: with `raw` it selects the
 // pure-DevX MPRQ raw-Ethernet engine (EngineType::IBVERBS); with `socket` (a
-// roce:// endpoint) it selects the RoCE/RDMA engine. Every other case defers to
-// the string-only resolver above.
+// roce:// endpoint) it selects the RoCE/RDMA engine. "gpunetio_verbs" splits the
+// same way between the GPUNetIO raw-Ethernet engine (EngineType::GPUNETIO_VERBS)
+// and the GPUNetIO RoCE engine (EngineType::GPUNETIO_RDMA). Every other case defers
+// to the string-only resolver above.
 inline EngineType config_engine_from_string(const std::string& str, StreamType stream_type) {
 #if DAQIRI_ENGINE_IBVERBS
   if (stream_type == StreamType::RAW && str == DAQIRI_ENGINE_STR__IBVERBS) {
     return EngineType::IBVERBS;
+  }
+#endif
+#if DAQIRI_ENGINE_GPUNETIO_VERBS
+  if (stream_type == StreamType::RAW && str == DAQIRI_ENGINE_STR__GPUNETIO_VERBS) {
+    return EngineType::GPUNETIO_VERBS;
   }
 #endif
   return config_engine_from_string(str);
@@ -543,6 +584,9 @@ inline EngineType config_engine_from_string(const std::string& str, StreamType s
 
 inline std::string config_engine_to_string(EngineType type) {
   if (type == EngineType::RDMA) { return DAQIRI_ENGINE_STR__IBVERBS; }
+  if (type == EngineType::GPUNETIO_RDMA) {
+    return DAQIRI_ENGINE_STR__GPUNETIO_VERBS;
+  }
   return engine_type_to_string(type);
 }
 
@@ -572,9 +616,11 @@ inline bool is_explicit_engine_type(EngineType type) {
 inline bool engine_type_supports_stream_type(EngineType type, StreamType stream_type) {
   switch (stream_type) {
     case StreamType::RAW:
-      return type == EngineType::DPDK || type == EngineType::IBVERBS;
+      return type == EngineType::DPDK || type == EngineType::IBVERBS ||
+             type == EngineType::GPUNETIO_VERBS;
     case StreamType::SOCKET:
-      return type == EngineType::SOCKET || type == EngineType::RDMA;
+      return type == EngineType::SOCKET || type == EngineType::RDMA ||
+             type == EngineType::GPUNETIO_RDMA;
     default:
       return false;
   }
@@ -582,7 +628,8 @@ inline bool engine_type_supports_stream_type(EngineType type, StreamType stream_
 
 inline bool engine_type_supports_socket_protocol(EngineType type, SocketProtocol protocol) {
   if (protocol == SocketProtocol::ROCE) {
-    return type == EngineType::RDMA || type == EngineType::SOCKET;
+    return type == EngineType::RDMA || type == EngineType::SOCKET ||
+           type == EngineType::GPUNETIO_RDMA;
   }
   if (protocol == SocketProtocol::TCP || protocol == SocketProtocol::UDP) {
     return type == EngineType::SOCKET;

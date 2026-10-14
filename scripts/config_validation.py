@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 
 
-KNOWN_ENGINES = frozenset(("socket", "dpdk", "ibverbs"))
+KNOWN_ENGINES = frozenset(("socket", "dpdk", "ibverbs", "gpunetio_verbs"))
 ENGINE_QUERY_ERROR = "Cannot determine the validator's compiled engines."
 NO_SUPPORTED_CONFIGURATIONS = "No configurations are supported by this validator."
 
@@ -60,14 +60,14 @@ def required_engines(document: Any) -> frozenset[str] | None:
     if stream_type == "raw":
         if explicit_engine in (None, "", "default"):
             return frozenset(("dpdk", "ibverbs"))
-        if explicit_engine in ("dpdk", "ibverbs"):
+        if explicit_engine in ("dpdk", "ibverbs", "gpunetio_verbs"):
             return frozenset((explicit_engine,))
         return None
 
     if stream_type != "socket":
         return None
-    if explicit_engine == "ibverbs":
-        return frozenset(("ibverbs",))
+    if explicit_engine in ("ibverbs", "gpunetio_verbs"):
+        return frozenset((explicit_engine,))
     if explicit_engine not in (None, "", "default", "socket"):
         return None
 

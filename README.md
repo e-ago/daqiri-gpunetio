@@ -42,6 +42,15 @@ DAQIRI provides direct NIC hardware access in userspace, bypassing the Linux ker
   region's configured `buf_size` defines its scatter span; short packets leave
   unused trailing segments at zero length. Raw ibverbs TX gathers up to four regions
   into one packet, including separate CPU headers and GPU payloads.
+- **GPU-driven raw Ethernet and RoCE (experimental)** — The opt-in `gpunetio_verbs` engine
+  (`-DDAQIRI_ENGINE="... gpunetio_verbs"`, `engine: "gpunetio_verbs"`, DOCA 3.6 or newer) drives
+  the NIC queues from CUDA kernels with DOCA Verbs and DOCA GPUNetIO: the kernels post the work
+  requests and poll their completions, so the CPU only hands bursts over and frees them. As with
+  `ibverbs`, a raw stream runs DOCA Verbs Ethernet queues, and a socket stream with `roce://`
+  endpoints runs DOCA Verbs RC queue pairs that interoperate with `ibverbs` RoCE peers. See the
+  [raw](https://nvidia.github.io/daqiri/api-reference/configuration/#gpunetio-verbs-engine) and
+  [RoCE](https://nvidia.github.io/daqiri/api-reference/configuration/#gpunetio-verbs-roce-engine)
+  references.
 - **Hardware RX reorder** — On ConnectX-7 or newer NICs, the raw ibverbs engine can use the mlx5
   flex parser for first-DMA placement into ordered CPU or GPU aggregates while the host polls CQEs.
 - **Burst file writes** — Write received bursts as raw packet files or appendable PCAP
