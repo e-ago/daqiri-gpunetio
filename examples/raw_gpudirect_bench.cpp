@@ -26,6 +26,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -199,6 +200,52 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Reorder geometry for the real-data workload: the seq number sits at the
+  // payload start (just after the UDP/IP header), and a window of up to 1024
+  // packets is reordered into a contiguous ~8 MB device buffer (matching the
+  // RoCE 8 MB working set) that the compute then consumes. The packet layout
+  // comes from bench_tx, or from bench_rx in an RX-only config (the receiver of
+  // a cross-host run).
+  uint32_t header_size = 0;
+  uint32_t payload_size = 0;
+  uint32_t batch_size = 1024;
+  if (!tx_configs.empty()) {
+    header_size = tx_configs.front().header_size;
+    payload_size = tx_configs.front().payload_size;
+    batch_size = tx_configs.front().batch_size;
+  } else {
+    header_size = rx_configs.front().header_size;
+    payload_size = rx_configs.front().payload_size;
+  }
+  daqiri::bench::ReorderGeometry geom;
+  if (payload_size > 0) {
+    geom.payload_segment = 0;
+    geom.payload_byte_offset = header_size;
+    geom.seq_bit_offset = static_cast<uint16_t>(header_size * 8);
+    geom.seq_bit_width = 32;
+    geom.out_payload_len = payload_size;
+    // Reorder window: ~8 MB (1024 packets at the native shape), matching the RoCE
+    // working set. Capped to one burst's packet count. The compute reads the first
+    // n*n*elem_size bytes of this window (GEMM dimension pinned via
+    // --workload-gemm-dim), so the window must be at least that large.
+    geom.packets_per_batch = std::min<uint32_t>(1024, batch_size);
+  } else if (workload != daqiri::bench::BenchWorkload::None) {
+    std::cerr << "--workload needs the packet layout: set payload_size and header_size in "
+                 "bench_rx when the config has no bench_tx\n";
+    return 1;
+  }
+
+  // Built before daqiri_init() and destroyed after shutdown(), see RxWorkload
+  std::vector<std::unique_ptr<daqiri::bench::RxWorkload>> rx_workloads;
+  for (size_t i = 0; i < rx_configs.size(); ++i) {
+    rx_workloads.push_back(std::make_unique<daqiri::bench::RxWorkload>());
+    if (workload != daqiri::bench::BenchWorkload::None &&
+        !rx_workloads.back()->init(workload, geom, workload_gemm_dim, workload_sync_interval,
+                                   workload_fft_len)) {
+      std::cerr << "RX workload init failed; continuing without GPU workload\n";
+    }
+  }
+
   if (daqiri::daqiri_init(argv[1]) != daqiri::Status::SUCCESS) {
     std::cerr << "daqiri_init failed\n";
     return 1;
@@ -210,28 +257,10 @@ int main(int argc, char **argv) {
   std::vector<std::thread> rx_threads;
   daqiri::bench::TokenBucketPacer tx_pacer(target_gbps);
 
-  // Reorder geometry for the real-data workload: the seq number sits at the
-  // payload start (just after the UDP/IP header), and a window of up to 1024
-  // packets is reordered into a contiguous ~8 MB device buffer (matching the
-  // RoCE 8 MB working set) that the compute then consumes.
-  daqiri::bench::ReorderGeometry geom;
-  if (!tx_configs.empty()) {
-    const auto& tx = tx_configs.front();
-    geom.payload_segment = 0;
-    geom.payload_byte_offset = tx.header_size;
-    geom.seq_bit_offset = static_cast<uint16_t>(tx.header_size * 8);
-    geom.seq_bit_width = 32;
-    geom.out_payload_len = tx.payload_size;
-    // Reorder window: ~8 MB (1024 packets at the native shape), matching the RoCE
-    // working set. Capped to one burst's packet count. The compute reads the first
-    // n*n*elem_size bytes of this window (GEMM dimension pinned via
-    // --workload-gemm-dim), so the window must be at least that large.
-    geom.packets_per_batch = std::min<uint32_t>(1024, tx.batch_size);
-  }
   rx_threads.reserve(rx_configs.size());
-  for (const auto &cfg : rx_configs) {
-    rx_threads.emplace_back(daqiri::bench::rx_count_worker, cfg, std::ref(stop), workload, geom,
-                            workload_gemm_dim, workload_sync_interval, workload_fft_len);
+  for (size_t i = 0; i < rx_configs.size(); ++i) {
+    rx_threads.emplace_back(daqiri::bench::run_rx_count, rx_configs[i], std::ref(stop),
+                            std::ref(*rx_workloads[i]), geom);
   }
   tx_threads.reserve(tx_configs.size());
   for (const auto &cfg : tx_configs) {
@@ -253,6 +282,7 @@ int main(int argc, char **argv) {
 
   daqiri::print_stats();
   daqiri::shutdown();
+  rx_workloads.clear();
   if (prometheus_metrics) {
     daqiri::bench::grafana::shutdown_prometheus_metrics();
   }

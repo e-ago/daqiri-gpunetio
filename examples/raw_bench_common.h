@@ -81,6 +81,10 @@ struct RawBenchRxConfig {
   std::string interface_name = "rx_port";
   int queue_id = -1;
   int cpu_core = -1;
+  // Layout of the received packets, for the --workload reorder of a config
+  // without bench_tx (the receiver of a cross-host run). 0 = not given.
+  uint32_t payload_size = 0;
+  uint32_t header_size = 64;
 };
 
 struct RawBenchQueueStats {
@@ -154,9 +158,29 @@ struct ReorderGeometry {
   int payload_segment = 0;            // packet segment carrying payload (1 = HDS)
 };
 
-// When `workload != None`, each RX thread builds its own GpuWorkload (cuFFT/
-// cuBLAS handles are not thread-safe to share) and its own ReorderPipeline, then
-// for each received burst reorders the real packet payloads into a contiguous
+// The GPU workload of one RX thread (cuFFT/cuBLAS handles are not thread-safe to
+// share): the representative compute and the ReorderPipeline that feeds it,
+// sharing one CUDA stream. Inert unless init() is given a workload.
+//
+// Engines with resident kernels (gpunetio_verbs) run them from daqiri_init() to
+// daqiri::shutdown(), and cudaFree() -- also called by the cuFFT/cuBLAS teardown
+// -- waits for them. With such an engine, init() must run before daqiri_init()
+// and the object must be destroyed after shutdown().
+struct RxWorkload {
+  GpuWorkload compute;
+  ReorderPipeline pipeline;
+
+  // Returns false, after logging why, if the compute or the pipeline cannot be
+  // set up.
+  bool init(BenchWorkload workload, const ReorderGeometry& geom, int workload_gemm_dim,
+            int workload_sync_interval, int workload_fft_len);
+  bool enabled() const {
+    return compute.enabled() && pipeline.enabled();
+  }
+};
+
+// When `workload != None`, each RX thread builds its own RxWorkload, then for
+// each received burst reorders the real packet payloads into a contiguous
 // device buffer (geom) and runs one representative compute on THAT buffer. The
 // stream is shared so the reorder kernel orders before the workload; the burst
 // is freed only after the stream drains (so the reorder has read the buffers).
@@ -165,5 +189,9 @@ void rx_count_worker(const RawBenchRxConfig& cfg, std::atomic<bool>& stop,
                      BenchWorkload workload = BenchWorkload::None, const ReorderGeometry& geom = {},
                      int workload_gemm_dim = 1024, int workload_sync_interval = 2,
                      int workload_fft_len = 1024);
+
+// rx_count_worker with an RxWorkload the caller built and destroys
+void run_rx_count(const RawBenchRxConfig& cfg, std::atomic<bool>& stop, RxWorkload& workload,
+                  const ReorderGeometry& geom);
 
 } // namespace daqiri::bench

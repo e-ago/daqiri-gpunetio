@@ -452,7 +452,7 @@ queue count, buffer memory type, NIC/GPU model, and whether a post-processing wo
 Compare hardware-loopback runs only with runs using the same setup. Use a cabled TX/RX test when
 the goal is physical port speed or end-to-end network performance.
 
-`daqiri_bench_raw_gpudirect` and `daqiri_bench_raw_hds` also accept `--workload none|fft|gemm|gemm_fp16`, which runs a representative GPU workload once per received reorder window on the **actual received packet data**: `fft` (batched cuFFT C2C transform), `gemm` (FP32 `cublasSgemm`), or `gemm_fp16` (the same-size mixed-precision FP16/tensor-core matmul that models inference). Each received burst's payloads are first reordered by sequence number into a contiguous GPU buffer (`examples/bench_pipeline.{h,cu}`) that the compute then consumes. `--workload-gemm-dim N` (default 1024) pins the square GEMM side length and `--workload-fft-len N` (default 1024) the 1-D FFT transform length, so the FLOP count per call stays constant as the I/O unit is swept. The same flags are honoured by the RoCE bench (`daqiri_bench_rdma`, in-order gather) and the socket bench (`daqiri_bench_socket`, host→device stage then UDP reorder / TCP gather). See the [DGX Spark GPU-workload results](performance-dgx-spark.md#two-link-receive-throughput-with-gpu-workloads).
+`daqiri_bench_raw_gpudirect` and `daqiri_bench_raw_hds` also accept `--workload none|fft|gemm|gemm_fp16`, which runs a representative GPU workload once per received reorder window on the **actual received packet data**: `fft` (batched cuFFT C2C transform), `gemm` (FP32 `cublasSgemm`), or `gemm_fp16` (the same-size mixed-precision FP16/tensor-core matmul that models inference). Each received burst's payloads are first reordered by sequence number into a contiguous GPU buffer (`examples/bench_pipeline.{h,cu}`) that the compute then consumes. `--workload-gemm-dim N` (default 1024) pins the square GEMM side length and `--workload-fft-len N` (default 1024) the 1-D FFT transform length, so the FLOP count per call stays constant as the I/O unit is swept. The same flags are honoured by the RoCE bench (`daqiri_bench_rdma`, in-order gather) and the socket bench (`daqiri_bench_socket`, host→device stage then UDP reorder / TCP gather). The reorder takes the packet layout from `bench_tx`; the receiver of a cross-host `daqiri_bench_raw_gpudirect` run has no `bench_tx`, so give it `payload_size` and `header_size` in `bench_rx`. See the [DGX Spark GPU-workload results](performance-dgx-spark.md#two-link-receive-throughput-with-gpu-workloads).
 
 ### GPUNetIO Verbs engine (experimental)
 
@@ -468,8 +468,8 @@ sudo env CUDA_MODULE_LOADING=EAGER ./build/examples/daqiri_bench_raw_gpudirect \
 
 Measure with `mlnx_perf` as above. `CUDA_MODULE_LOADING=EAGER` loads every kernel at startup:
 with lazy loading, a kernel launched for the first time waits for the engine's resident kernels to
-exit. Keep `--workload none` for now: the workload modes free GPU memory with `cudaFree()` before
-shutdown, which also waits for the resident kernels. See the
+exit. `cudaFree()` waits for the resident kernels too, so `daqiri_bench_raw_gpudirect` sets up its
+`--workload` before `daqiri_init()` and frees it after shutdown. See the
 [GPUNetIO Verbs engine reference](../api-reference/configuration.md#gpunetio-verbs-engine) for the
 receive ring sizing and the packet ownership rules.
 

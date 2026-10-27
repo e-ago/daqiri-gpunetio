@@ -177,6 +177,8 @@ RawBenchRxConfig parse_rx_item(const YAML::Node &rx) {
   cfg.interface_name = rx["interface_name"].as<std::string>(cfg.interface_name);
   cfg.queue_id = rx["queue_id"].as<int>(cfg.queue_id);
   cfg.cpu_core = rx["cpu_core"].as<int>(cfg.cpu_core);
+  cfg.payload_size = rx["payload_size"].as<uint32_t>(cfg.payload_size);
+  cfg.header_size = rx["header_size"].as<uint32_t>(cfg.header_size);
   if (cfg.cpu_core < -1) {
     throw std::runtime_error("bench_rx cpu_core is out of range for " +
                              cfg.interface_name);
@@ -598,32 +600,44 @@ void print_queue_stats(const char *direction, const std::string &interface_name,
             << std::endl;
 }
 
+bool RxWorkload::init(BenchWorkload workload, const ReorderGeometry& geom, int workload_gemm_dim,
+                      int workload_sync_interval, int workload_fft_len) {
+  // The pipeline shares the compute's CUDA stream so the reorder kernel orders
+  // before the compute with no extra sync.
+  const uint32_t out_payload_len = geom.out_payload_len > 0 ? geom.out_payload_len : 1;
+  const size_t batch_bytes = static_cast<size_t>(geom.packets_per_batch) * out_payload_len;
+  return compute.init(workload, batch_bytes, workload_sync_interval, workload_gemm_dim,
+                      workload_fft_len) &&
+         pipeline.init(ReorderMode::SeqReorder, geom.packets_per_batch, out_payload_len,
+                       geom.payload_byte_offset, geom.seq_bit_offset, geom.seq_bit_width,
+                       /*staging_needed=*/false, compute.stream());
+}
+
 void rx_count_worker(const RawBenchRxConfig& cfg, std::atomic<bool>& stop, BenchWorkload workload,
                      const ReorderGeometry& geom, int workload_gemm_dim,
                      int workload_sync_interval, int workload_fft_len) {
+  // Per-thread representative GPU workload + reorder pipeline (both inert unless
+  // --workload is set). If init fails we warn and keep counting so the run still
+  // produces throughput.
+  RxWorkload rx_workload;
+  if (workload != BenchWorkload::None &&
+      !rx_workload.init(workload, geom, workload_gemm_dim, workload_sync_interval,
+                        workload_fft_len)) {
+    std::cerr << "RX workload init failed; continuing without GPU workload\n";
+  }
+  run_rx_count(cfg, stop, rx_workload, geom);
+}
+
+void run_rx_count(const RawBenchRxConfig& cfg, std::atomic<bool>& stop, RxWorkload& workload,
+                  const ReorderGeometry& geom) {
   if (!set_current_thread_affinity(cfg.cpu_core, "bench_rx")) {
     stop.store(true);
     return;
   }
 
-  // Per-thread representative GPU workload + reorder pipeline (both inert unless
-  // --workload is set). If init fails we warn and keep counting so the run still
-  // produces throughput. The pipeline shares the workload's CUDA stream so the
-  // reorder kernel orders before the compute with no extra sync.
-  const uint32_t out_payload_len = geom.out_payload_len > 0 ? geom.out_payload_len : 1;
-  const size_t batch_bytes = static_cast<size_t>(geom.packets_per_batch) * out_payload_len;
-  GpuWorkload gpu_workload;
-  ReorderPipeline pipeline;
-  if (workload != BenchWorkload::None) {
-    if (!gpu_workload.init(workload, batch_bytes, workload_sync_interval, workload_gemm_dim,
-                           workload_fft_len) ||
-        !pipeline.init(ReorderMode::SeqReorder, geom.packets_per_batch, out_payload_len,
-                       geom.payload_byte_offset, geom.seq_bit_offset, geom.seq_bit_width,
-                       /*staging_needed=*/false, gpu_workload.stream())) {
-      std::cerr << "RX workload init failed; continuing without GPU workload\n";
-    }
-  }
-  const bool run_workload = gpu_workload.enabled() && pipeline.enabled();
+  GpuWorkload& gpu_workload = workload.compute;
+  ReorderPipeline& pipeline = workload.pipeline;
+  const bool run_workload = workload.enabled();
 
   const int port_id = daqiri::get_port_id(cfg.interface_name);
   if (port_id < 0) {
